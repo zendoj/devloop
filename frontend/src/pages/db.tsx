@@ -1337,7 +1337,7 @@ export default function DbPage() {
                   type="text"
                   value={search}
                   onChange={(e) => handleSetSearch(e.target.value)}
-                  placeholder="Sök tabell..."
+                  placeholder="Search table..."
                   style={{
                     width: '100%', padding: '4px 8px 4px 26px', borderRadius: 6,
                     border: '1px solid #d1d5db', fontSize: 12, outline: 'none',
@@ -1361,12 +1361,12 @@ export default function DbPage() {
         {/* Content area — scrollable */}
         {isLoading && (
           <div style={{ textAlign: 'center', color: '#9ca3af', padding: 40, fontSize: 14 }}>
-            Laddar databasstruktur...
+            Loading database schema...
           </div>
         )}
         {error && (
           <div style={{ textAlign: 'center', color: '#dc2626', padding: 40, fontSize: 14 }}>
-            Kunde inte ladda DB-schema. Kontrollera att du är inloggad.
+            Could not load DB schema. Check that you are logged in.
           </div>
         )}
 

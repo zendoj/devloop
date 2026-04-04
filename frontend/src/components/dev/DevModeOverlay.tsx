@@ -315,7 +315,7 @@ export function DevModeOverlay() {
         }}>
           <span style={{ width: 12, height: 12, borderRadius: '50%', background: '#dc2626', animation: 'pulse 1.5s infinite' }} />
           <span>REC {String(mins).padStart(2, '0')}:{String(secs).padStart(2, '0')}</span>
-          <span style={{ color: 'rgba(255,255,255,0.5)', fontSize: 12 }}>{recordingFrames.length} bilder · {recordingLogs.length} loggar</span>
+          <span style={{ color: 'rgba(255,255,255,0.5)', fontSize: 12 }}>{recordingFrames.length} frames · {recordingLogs.length} logs</span>
           <button
             onClick={stopRecording}
             style={{
@@ -324,7 +324,7 @@ export function DevModeOverlay() {
               fontSize: 13, fontWeight: 700,
             }}
           >
-            Stoppa
+            Stop
           </button>
         </div>
         <style>{`@keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.3; } }`}</style>
@@ -362,7 +362,7 @@ export function DevModeOverlay() {
           setTimeout(() => clearRecording(), 3000);
         }
       } catch {
-        alert('Kunde inte skapa rapport');
+        alert('Could not create report');
       }
       setReviewSubmitting(false);
     };
@@ -376,18 +376,18 @@ export function DevModeOverlay() {
         {/* Header */}
         <div style={{ padding: '16px 24px', display: 'flex', alignItems: 'center', justifyContent: 'space-between', borderBottom: '1px solid rgba(255,255,255,0.1)' }}>
           <div style={{ color: '#fff', fontSize: 16, fontWeight: 700 }}>
-            Granska inspelning — {recordingFrames.length} bilder
+            Review recording — {recordingFrames.length} frames
           </div>
           <div style={{ display: 'flex', gap: 8 }}>
             <button onClick={clearRecording} style={{ padding: '6px 16px', borderRadius: 8, border: '1px solid rgba(255,255,255,0.2)', background: 'transparent', color: '#fff', cursor: 'pointer', fontSize: 13 }}>
-              Avbryt
+              Cancel
             </button>
             <button
               onClick={submitSequence}
               disabled={reviewSubmitting}
               style={{ padding: '6px 16px', borderRadius: 8, border: 'none', background: '#2563eb', color: '#fff', cursor: 'pointer', fontSize: 13, fontWeight: 700, opacity: reviewSubmitting ? 0.5 : 1 }}
             >
-              {reviewSubmitting ? 'Skapar...' : 'Skapa rapport'}
+              {reviewSubmitting ? 'Creating...' : 'Create report'}
             </button>
           </div>
         </div>
@@ -397,7 +397,7 @@ export function DevModeOverlay() {
           <textarea
             value={reviewDescription}
             onChange={(e) => setReviewDescription(e.target.value)}
-            placeholder="Beskriv övergripande vad du testade..."
+            placeholder="Describe what you tested..."
             rows={2}
             style={{ width: '100%', padding: 10, borderRadius: 8, border: '1px solid rgba(255,255,255,0.2)', background: 'rgba(255,255,255,0.1)', color: '#fff', fontSize: 13, resize: 'none', fontFamily: 'inherit' }}
           />
@@ -481,7 +481,7 @@ export function DevModeOverlay() {
                             frames[reviewSelectedIdx] = { ...frames[reviewSelectedIdx], annotations: frames[reviewSelectedIdx].annotations.map((ann, j) => j === ai ? updated : ann) };
                             useDevModeStore.setState({ recordingFrames: frames });
                           }}
-                          placeholder="Beskriv vad som är fel här..."
+                          placeholder="Describe what is wrong here..."
                           style={{ flex: 1, padding: '4px 8px', borderRadius: 4, border: '1px solid rgba(255,255,255,0.2)', background: 'rgba(255,255,255,0.1)', color: '#fff', fontSize: 11, fontFamily: 'inherit' }}
                         />
                       </div>
@@ -494,7 +494,7 @@ export function DevModeOverlay() {
                   <textarea
                     value={recordingFrames[reviewSelectedIdx].comment}
                     onChange={(e) => setFrameComment(reviewSelectedIdx, e.target.value)}
-                    placeholder="Övergripande kommentar för denna bild (valfritt)..."
+                    placeholder="Comment for this frame (optional)..."
                     rows={2}
                     style={{ width: '100%', padding: 8, borderRadius: 6, border: '1px solid rgba(255,255,255,0.2)', background: 'rgba(255,255,255,0.1)', color: '#fff', fontSize: 12, resize: 'none', fontFamily: 'inherit' }}
                   />
@@ -503,7 +503,7 @@ export function DevModeOverlay() {
                 {/* Clicks during this frame */}
                 {recordingFrames[reviewSelectedIdx].clicks.length > 0 && (
                   <div style={{ marginTop: 8, maxWidth: 600, alignSelf: 'center', width: '100%' }}>
-                    <div style={{ fontSize: 11, color: 'rgba(255,255,255,0.5)', marginBottom: 4 }}>Klick under denna frame:</div>
+                    <div style={{ fontSize: 11, color: 'rgba(255,255,255,0.5)', marginBottom: 4 }}>Clicks during this frame:</div>
                     {recordingFrames[reviewSelectedIdx].clicks.map((c, ci) => (
                       <div key={ci} style={{ fontSize: 10, color: 'rgba(255,255,255,0.6)', padding: '2px 0' }}>
                         → &lt;{c.tag}&gt; &quot;{c.text.slice(0, 30)}&quot; ({c.selector.slice(0, 40)})
@@ -523,7 +523,7 @@ export function DevModeOverlay() {
           {/* Activity log panel */}
           <div style={{ width: 240, borderLeft: '1px solid rgba(255,255,255,0.1)', overflow: 'auto', padding: 8 }}>
             <div style={{ fontSize: 11, fontWeight: 700, color: 'rgba(255,255,255,0.7)', marginBottom: 8, padding: '0 4px' }}>
-              Aktivitetslogg ({recordingLogs.length})
+              Activity log ({recordingLogs.length})
             </div>
             {recordingLogs.map((log, i) => {
               const ts = new Date(log.timestamp);
@@ -543,7 +543,7 @@ export function DevModeOverlay() {
         {/* Submitted confirmation */}
         {lastSubmittedId && state === 'reviewing' && (
           <div style={{ position: 'fixed', bottom: 24, left: '50%', transform: 'translateX(-50%)', padding: '12px 24px', borderRadius: 10, background: '#16a34a', color: '#fff', fontSize: 14, fontWeight: 700, zIndex: OVERLAY_Z + 30 }}>
-            Rapport skapad: {lastSubmittedId}
+            Report created: {lastSubmittedId}
           </div>
         )}
       </div>
@@ -572,10 +572,10 @@ export function DevModeOverlay() {
         <span>DEV MODE — Klicka på element för att rapportera</span>
         <div style={{ display: 'flex', gap: 8 }}>
           <button onClick={toggleSidebar} style={{ background: 'rgba(255,255,255,0.2)', border: 'none', color: '#fff', padding: '2px 8px', borderRadius: 4, cursor: 'pointer', fontSize: 11, fontWeight: 600 }}>
-            Rapporter
+            Reports
           </button>
           <button onClick={deactivate} style={{ background: 'rgba(255,255,255,0.2)', border: 'none', color: '#fff', padding: '2px 8px', borderRadius: 4, cursor: 'pointer', fontSize: 11, fontWeight: 600 }}>
-            Stäng (Esc)
+            Close (Esc)
           </button>
         </div>
       </div>
@@ -639,15 +639,15 @@ export function DevModeOverlay() {
           }}>
             {state === 'submitted' && lastSubmittedId ? (
               <div style={{ textAlign: 'center', padding: 8 }}>
-                <div style={{ fontSize: 14, fontWeight: 700, color: '#28a745', marginBottom: 4 }}>Rapport skickad!</div>
+                <div style={{ fontSize: 14, fontWeight: 700, color: '#28a745', marginBottom: 4 }}>Report submitted!</div>
                 <div style={{ fontSize: 20, fontWeight: 800, color: '#1a1a2e', marginBottom: 8 }}>{lastSubmittedId}</div>
                 <div style={{ fontSize: 11, color: '#666', marginBottom: 12 }}>Referera till detta ID i chatten</div>
                 <div style={{ display: 'flex', gap: 6 }}>
                   <button onClick={clearSelection} style={{ flex: 1, padding: '6px 0', borderRadius: 6, background: '#3b82f6', color: '#fff', border: 'none', cursor: 'pointer', fontSize: 12, fontWeight: 600 }}>
-                    Ny rapport
+                    New report
                   </button>
                   <button onClick={deactivate} style={{ flex: 1, padding: '6px 0', borderRadius: 6, background: '#e9ecef', color: '#333', border: 'none', cursor: 'pointer', fontSize: 12, fontWeight: 600 }}>
-                    Stäng
+                    Close
                   </button>
                 </div>
               </div>
@@ -658,7 +658,7 @@ export function DevModeOverlay() {
                 </div>
                 {selectedElement.componentInfo && (
                   <div style={{ fontSize: 10, color: '#3b82f6', marginBottom: 4 }}>
-                    Komponent: {selectedElement.componentInfo}
+                    Component: {selectedElement.componentInfo}
                   </div>
                 )}
                 {selectedElement.text && (
@@ -669,7 +669,7 @@ export function DevModeOverlay() {
                 <textarea
                   value={description}
                   onChange={(e) => { setDescription(e.target.value); setState('editing'); }}
-                  placeholder="Beskriv buggen eller vad som ska ändras..."
+                  placeholder="Describe the bug or what should change..."
                   autoFocus
                   style={{
                     width: '100%', height: 80, borderRadius: 6,
@@ -689,10 +689,10 @@ export function DevModeOverlay() {
                       fontSize: 12, fontWeight: 600,
                     }}
                   >
-                    {submitting ? 'Skickar...' : 'Skicka rapport (⌘+Enter)'}
+                    {submitting ? 'Submitting...' : 'Submit report (⌘+Enter)'}
                   </button>
                   <button onClick={clearSelection} style={{ padding: '6px 10px', borderRadius: 6, background: '#e9ecef', color: '#333', border: 'none', cursor: 'pointer', fontSize: 12, fontWeight: 600 }}>
-                    Avbryt
+                    Cancel
                   </button>
                 </div>
               </>

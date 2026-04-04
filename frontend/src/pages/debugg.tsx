@@ -34,10 +34,10 @@ type DevReport = {
 };
 
 const STATUS_OPTIONS = [
-  { value: 'new', label: 'Ny', color: '#6b7280' },
-  { value: 'in-progress', label: 'Pågående', color: '#f59e0b' },
-  { value: 'done', label: 'Klar', color: '#22c55e' },
-  { value: 'not-solved', label: 'Ej löst', color: '#dc2626' },
+  { value: 'new', label: 'New', color: '#6b7280' },
+  { value: 'in-progress', label: 'In Progress', color: '#f59e0b' },
+  { value: 'done', label: 'Done', color: '#22c55e' },
+  { value: 'not-solved', label: 'Not Solved', color: '#dc2626' },
 ];
 
 function StatusBadge({ status }: { status: string }) {
@@ -85,12 +85,12 @@ function ReportCard({ report, onUpdate, onDelete, isOpen, onToggle }: { report: 
     setSaving(true);
     try {
       await api.patch(`/dev-reports/${report.id}`, fields);
-      toast.success('Sparad');
+      toast.success('Saved');
       setCommentDirty(false);
       setAssigneeDirty(false);
       onUpdate();
     } catch {
-      toast.error('Kunde inte spara');
+      toast.error('Could not save');
     }
     setSaving(false);
   }, [report.id, onUpdate]);
@@ -110,7 +110,7 @@ function ReportCard({ report, onUpdate, onDelete, isOpen, onToggle }: { report: 
   };
 
   const handleDelete = () => {
-    if (window.confirm(`Ta bort rapport ${report.displayId}? Detta kan inte ångras.`)) {
+    if (window.confirm(`Delete report ${report.displayId}? This cannot be undone.`)) {
       onDelete(report.id);
     }
   };
@@ -196,17 +196,17 @@ function ReportCard({ report, onUpdate, onDelete, isOpen, onToggle }: { report: 
           }}
         >
           {expanded ? (
-            <><ChevronUp size={14} /> Stäng</>
+            <><ChevronUp size={14} /> Close</>
           ) : (
-            <><ExternalLink size={14} /> Öppna</>
+            <><ExternalLink size={14} /> Open</>
           )}
         </button>
       </div>
 
-      {/* Debugg-text — always visible, editable via Ändra-knapp */}
+      {/* Description — always visible, editable via Edit button */}
       <div style={{ padding: '0 16px 8px' }}>
         <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginBottom: 3 }}>
-          <label style={{ fontSize: 11, color: '#9ca3af' }}>Debugg-text</label>
+          <label style={{ fontSize: 11, color: '#9ca3af' }}>Description</label>
           {!editingDesc && (
             <button
               onClick={(e) => { e.stopPropagation(); setEditingDesc(true); }}
@@ -216,7 +216,7 @@ function ReportCard({ report, onUpdate, onDelete, isOpen, onToggle }: { report: 
                 background: '#fff', color: '#374151', fontSize: 11, cursor: 'pointer',
               }}
             >
-              <Pencil size={10} /> Ändra
+              <Pencil size={10} /> Edit
             </button>
           )}
         </div>
@@ -242,10 +242,10 @@ function ReportCard({ report, onUpdate, onDelete, isOpen, onToggle }: { report: 
                   setSaving(true);
                   try {
                     await api.patch(`/dev-reports/${report.id}`, { description });
-                    toast.success('Beskrivning sparad — ny txt/zip genereras vid nedladdning');
+                    toast.success('Description saved');
                     setEditingDesc(false);
                     onUpdate();
-                  } catch { toast.error('Kunde inte spara'); }
+                  } catch { toast.error('Could not save'); }
                   setSaving(false);
                 }}
                 disabled={saving}
@@ -255,7 +255,7 @@ function ReportCard({ report, onUpdate, onDelete, isOpen, onToggle }: { report: 
                   border: 'none', cursor: 'pointer', fontSize: 12, fontWeight: 600, whiteSpace: 'nowrap',
                 }}
               >
-                <Save size={12} /> {saving ? 'Sparar...' : 'Spara'}
+                <Save size={12} /> {saving ? 'Saving...' : 'Save'}
               </button>
               <button
                 onClick={(e) => { e.stopPropagation(); setDescription(report.description || ''); setEditingDesc(false); }}
@@ -264,7 +264,7 @@ function ReportCard({ report, onUpdate, onDelete, isOpen, onToggle }: { report: 
                   border: '1px solid #d1d5db', cursor: 'pointer', fontSize: 12, fontWeight: 600, whiteSpace: 'nowrap',
                 }}
               >
-                Avbryt
+                Cancel
               </button>
             </div>
           </div>
@@ -297,9 +297,9 @@ function ReportCard({ report, onUpdate, onDelete, isOpen, onToggle }: { report: 
         </div>
       )}
 
-      {/* Tråd — always visible */}
+      {/* Thread — always visible */}
       <div style={{ padding: '0 16px 12px' }}>
-        <label style={{ fontSize: 11, color: '#9ca3af', display: 'block', marginBottom: 6 }}>Tråd</label>
+        <label style={{ fontSize: 11, color: '#9ca3af', display: 'block', marginBottom: 6 }}>Thread</label>
         {/* Existing thread messages */}
         {(report.thread || []).length > 0 && (
           <div style={{ marginBottom: 8, display: 'flex', flexDirection: 'column', gap: 4 }}>
@@ -335,7 +335,7 @@ function ReportCard({ report, onUpdate, onDelete, isOpen, onToggle }: { report: 
               el.style.height = 'auto';
               el.style.height = Math.min(el.scrollHeight, 120) + 'px';
             }}
-            placeholder="Skriv en kommentar..."
+            placeholder="Write a comment..."
             rows={1}
             style={{
               flex: 1, padding: '6px 10px', borderRadius: 6,
@@ -352,7 +352,7 @@ function ReportCard({ report, onUpdate, onDelete, isOpen, onToggle }: { report: 
                   await api.post(`/dev-reports/${report.id}/thread`, { author: report.userEmail || 'Jonas', text: comment.trim() });
                   setComment('');
                   onUpdate();
-                } catch { toast.error('Kunde inte spara'); }
+                } catch { toast.error('Could not save'); }
                 setSaving(false);
               }
             }}
@@ -366,7 +366,7 @@ function ReportCard({ report, onUpdate, onDelete, isOpen, onToggle }: { report: 
                 await api.post(`/dev-reports/${report.id}/thread`, { author: report.userEmail || 'Jonas', text: comment.trim() });
                 setComment('');
                 onUpdate();
-              } catch { toast.error('Kunde inte spara'); }
+              } catch { toast.error('Could not save'); }
               setSaving(false);
             }}
             disabled={saving || !comment.trim()}
@@ -377,7 +377,7 @@ function ReportCard({ report, onUpdate, onDelete, isOpen, onToggle }: { report: 
               opacity: !comment.trim() ? 0.5 : 1, whiteSpace: 'nowrap',
             }}
           >
-            <Save size={12} /> Skicka
+            <Save size={12} /> Send
           </button>
         </div>
       </div>
@@ -435,18 +435,18 @@ function ReportCard({ report, onUpdate, onDelete, isOpen, onToggle }: { report: 
                 marginBottom: 1,
               }}
             >
-              <Trash2 size={14} /> Ta bort
+              <Trash2 size={14} /> Delete
             </button>
           </div>
 
           {/* Info grid */}
           <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12, marginTop: 16, fontSize: 12 }}>
             <div>
-              <div style={{ color: '#9ca3af', marginBottom: 2 }}>Sida</div>
+              <div style={{ color: '#9ca3af', marginBottom: 2 }}>Page</div>
               <div style={{ color: '#374151', wordBreak: 'break-all' }}>{report.pageUrl}</div>
             </div>
             <div>
-              <div style={{ color: '#9ca3af', marginBottom: 2 }}>Rapporterad av</div>
+              <div style={{ color: '#9ca3af', marginBottom: 2 }}>Reported by</div>
               <div style={{ color: '#374151' }}>{report.userEmail || '—'}</div>
             </div>
             {report.elementSelector && (
@@ -463,7 +463,7 @@ function ReportCard({ report, onUpdate, onDelete, isOpen, onToggle }: { report: 
             )}
             {report.componentInfo && (
               <div>
-                <div style={{ color: '#9ca3af', marginBottom: 2 }}>Komponent</div>
+                <div style={{ color: '#9ca3af', marginBottom: 2 }}>Component</div>
                 <div style={{ color: '#374151' }}>{report.componentInfo}</div>
               </div>
             )}
@@ -492,7 +492,7 @@ function ReportCard({ report, onUpdate, onDelete, isOpen, onToggle }: { report: 
           {/* Sequence recording */}
           {report.sequence && report.sequence.length > 0 && (
             <div style={{ marginTop: 12 }}>
-              <div style={{ color: '#9ca3af', fontSize: 12, marginBottom: 6 }}>Inspelning ({report.sequence.length} bilder)</div>
+              <div style={{ color: '#9ca3af', fontSize: 12, marginBottom: 6 }}>Recording ({report.sequence.length} bilder)</div>
               <div style={{ display: 'flex', gap: 6, overflow: 'auto', paddingBottom: 8 }}>
                 {report.sequence.map((frame, i) => {
                   const ts = new Date(frame.timestamp);
@@ -521,7 +521,7 @@ function ReportCard({ report, onUpdate, onDelete, isOpen, onToggle }: { report: 
           {/* Console errors */}
           {report.consoleErrors && report.consoleErrors.length > 0 && (
             <div style={{ marginTop: 12 }}>
-              <div style={{ color: '#9ca3af', fontSize: 12, marginBottom: 4 }}>Konsolfel</div>
+              <div style={{ color: '#9ca3af', fontSize: 12, marginBottom: 4 }}>Console errors</div>
               <div style={{ background: '#1a1a2e', color: '#f87171', padding: 8, borderRadius: 6, fontSize: 11, fontFamily: 'monospace', maxHeight: 120, overflow: 'auto' }}>
                 {report.consoleErrors.map((e, i) => (
                   <div key={i}>{e}</div>
@@ -548,7 +548,7 @@ function ReportCard({ report, onUpdate, onDelete, isOpen, onToggle }: { report: 
               style={{ display: 'flex', alignItems: 'center', gap: 4, padding: '6px 12px', borderRadius: 6, background: '#f0fdf4', color: '#16a34a', fontSize: 12, fontWeight: 600, textDecoration: 'none', border: '1px solid #bbf7d0' }}
               onClick={(e) => e.stopPropagation()}
             >
-              <FileText size={14} /> Rapport (.txt)
+              <FileText size={14} /> Report (.txt)
             </a>
             <a
               href={`/api/dev-reports/${report.displayId}/download.zip`}
@@ -588,24 +588,24 @@ function FileSharePanel() {
       });
       await api.post('/dev-reports/files/upload', { filename: file.name, data: base64 });
       qc.invalidateQueries({ queryKey: ['dev-files'] });
-      toast.success('Fil uppladdad');
+      toast.success('File uploaded');
     } catch {
-      toast.error('Kunde inte ladda upp');
+      toast.error('Could not upload');
     }
     setUploading(false);
   };
 
   const handleDelete = async (id: string) => {
-    if (!confirm('Ta bort filen?')) return;
+    if (!confirm('Delete file?')) return;
     await api.delete(`/dev-reports/files/${id}`);
     qc.invalidateQueries({ queryKey: ['dev-files'] });
-    toast.success('Fil borttagen');
+    toast.success('File deleted');
   };
 
   const copyFilePath = (f: SharedFile) => {
     const fullPath = `/${f.filePath}`;
     navigator.clipboard.writeText(fullPath);
-    toast.success('Sökväg kopierad');
+    toast.success('Path copied');
   };
 
   return (
@@ -616,7 +616,7 @@ function FileSharePanel() {
       <div style={{ padding: '12px 12px 8px', borderBottom: '1px solid #f3f4f6' }}>
         <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginBottom: 8 }}>
           <FolderOpen size={14} style={{ color: '#2563eb' }} />
-          <span style={{ fontSize: 13, fontWeight: 700, color: '#1a1a2e' }}>Filer</span>
+          <span style={{ fontSize: 13, fontWeight: 700, color: '#1a1a2e' }}>Files</span>
         </div>
         <input
           ref={fileInputRef}
@@ -637,13 +637,13 @@ function FileSharePanel() {
             cursor: 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 4,
           }}
         >
-          <Upload size={12} /> {uploading ? 'Laddar upp...' : 'Ladda upp fil'}
+          <Upload size={12} /> {uploading ? 'Uploading...' : 'Upload file'}
         </button>
       </div>
       <div style={{ flex: 1, overflow: 'auto', padding: 4 }}>
         {files.length === 0 ? (
           <div style={{ padding: 12, textAlign: 'center', color: '#9ca3af', fontSize: 11 }}>
-            Inga filer ännu
+            No files yet
           </div>
         ) : (
           files.map((f) => (
@@ -661,7 +661,7 @@ function FileSharePanel() {
                 <button
                   onClick={() => copyFilePath(f)}
                   style={{ padding: '2px 5px', borderRadius: 3, border: '1px solid #e5e7eb', background: '#fff', cursor: 'pointer', fontSize: 10, color: '#6b7280', display: 'flex', alignItems: 'center', gap: 2 }}
-                  title="Kopiera filnamn"
+                  title="Copy file path"
                 >
                   <Copy size={9} />
                 </button>
@@ -669,14 +669,14 @@ function FileSharePanel() {
                   href={`/api/dev-reports/files/${f.id}/download`}
                   download
                   style={{ padding: '2px 5px', borderRadius: 3, border: '1px solid #e5e7eb', background: '#fff', cursor: 'pointer', fontSize: 10, color: '#2563eb', display: 'flex', alignItems: 'center', gap: 2, textDecoration: 'none' }}
-                  title="Ladda ner"
+                  title="Download"
                 >
                   <Download size={9} />
                 </a>
                 <button
                   onClick={() => handleDelete(f.id)}
                   style={{ padding: '2px 5px', borderRadius: 3, border: '1px solid #fecaca', background: '#fff', cursor: 'pointer', fontSize: 10, color: '#dc2626', display: 'flex', alignItems: 'center', gap: 2 }}
-                  title="Ta bort"
+                  title="Delete"
                 >
                   <Trash2 size={9} />
                 </button>
@@ -723,7 +723,7 @@ function SystemStatus() {
       <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
         <span style={{ width: 8, height: 8, borderRadius: '50%', background: backendUp ? '#22c55e' : backendUp === false ? '#dc2626' : '#9ca3af' }} />
         <span style={{ fontWeight: 600, color: backendUp ? '#16a34a' : '#dc2626' }}>
-          Backend: {backendUp === null ? '...' : backendUp ? 'Online' : 'Nere'}
+          Backend: {backendUp === null ? '...' : backendUp ? 'Online' : 'Down'}
         </span>
       </div>
       <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
@@ -736,7 +736,7 @@ function SystemStatus() {
           <div style={{ display: 'flex', alignItems: 'center', gap: 6, flex: 1, minWidth: 0 }}>
             <span style={{ width: 8, height: 8, borderRadius: '50%', background: '#f59e0b', animation: 'pulse 2s infinite' }} />
             <span style={{ fontWeight: 500, color: '#92400e', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-              Pågår: {currentTask}
+              Working on: {currentTask}
             </span>
           </div>
         </>
@@ -795,11 +795,11 @@ export default function DebuggPage() {
   const handleDelete = useCallback(async (id: string) => {
     try {
       await api.delete(`/dev-reports/${id}`);
-      toast.success('Rapport borttagen');
+      toast.success('Report deleted');
       updateUrl({ report: null });
       refresh();
     } catch {
-      toast.error('Kunde inte ta bort');
+      toast.error('Could not delete');
     }
   }, [refresh, updateUrl]);
 
@@ -815,7 +815,7 @@ export default function DebuggPage() {
 
   return (
     <>
-      <Topbar title="Debugg" subtitle="Buggrapporter och felhantering" />
+      <Topbar title="Debugg" subtitle="Bug reports and error handling" />
       <SystemStatus />
       <div style={{ display: 'flex', flex: 1, overflow: 'hidden' }}>
       <FileSharePanel />
@@ -823,11 +823,11 @@ export default function DebuggPage() {
         {/* Filter tabs */}
         <div style={{ display: 'flex', gap: 8, marginBottom: 20, flexWrap: 'wrap' }}>
           {[
-            { key: 'all', label: 'Alla' },
-            { key: 'new', label: 'Nya' },
-            { key: 'in-progress', label: 'Pågående' },
-            { key: 'not-solved', label: 'Ej löst' },
-            { key: 'done', label: 'Klara' },
+            { key: 'all', label: 'All' },
+            { key: 'new', label: 'New' },
+            { key: 'in-progress', label: 'In Progress' },
+            { key: 'not-solved', label: 'Not Solved' },
+            { key: 'done', label: 'Done' },
           ].map((f) => (
             <button
               key={f.key}
@@ -851,10 +851,10 @@ export default function DebuggPage() {
 
         {/* Report list */}
         {isLoading ? (
-          <div style={{ textAlign: 'center', color: '#9ca3af', padding: 40 }}>Laddar rapporter...</div>
+          <div style={{ textAlign: 'center', color: '#9ca3af', padding: 40 }}>Loading reports...</div>
         ) : filtered.length === 0 ? (
           <div style={{ textAlign: 'center', color: '#9ca3af', padding: 40 }}>
-            Inga rapporter{filter !== 'all' ? ' med denna status' : ''}. Använd Ctrl+Shift+D för att skapa en.
+            No reports{filter !== 'all' ? ' with this status' : ''}. Use Ctrl+Shift+D to create one.
           </div>
         ) : (
           filtered.map((r) => (
