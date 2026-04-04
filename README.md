@@ -7,8 +7,8 @@ Developer debugging, bug reporting, file sharing & database viewer toolkit for *
 ### Bug Reporting (Ctrl+Shift+D)
 - Visual bug reporting overlay — click on any element to report
 - Captures screenshot, CSS selector, console errors, viewport, and page URL
-- Swedish display IDs (e.g. "Anna738", "Viktor449")
-- Status workflow: Ny → Pågående → Klar / Ej löst
+- Name-based display IDs for easy reference (e.g. "Alice738", "David449")
+- Status workflow: New → In Progress → Done / Not Solved
 - Quick action buttons on each report card
 - Thread-based comments with author and timestamps
 - URL shown as clickable link on each report
@@ -31,7 +31,7 @@ Developer debugging, bug reporting, file sharing & database viewer toolkit for *
 ### File Sharing
 - Upload, download, delete files
 - Copy full system path for easy reference
-- Shared across all users in the debugg panel
+- Shared across all users in the debug panel
 
 ### Database Viewer
 - Interactive schema viewer with draggable table cards
@@ -111,7 +111,7 @@ export default function Layout({ children }) {
 }
 ```
 
-2. Add the debugg and db pages to your routing.
+2. Add the debug and db pages to your routing.
 
 3. Install dependency: `npm install html2canvas`
 

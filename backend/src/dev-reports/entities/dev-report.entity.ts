@@ -10,7 +10,7 @@ export class DevReport {
   @PrimaryGeneratedColumn('uuid')
   id!: string;
 
-  /** Human-friendly ID, e.g. "Arne201" */
+  /** Human-friendly ID, e.g. "Alice201" */
   @Column({ type: 'varchar', unique: true })
   displayId!: string;
 

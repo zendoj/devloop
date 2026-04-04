@@ -6,12 +6,10 @@ import { DevReportFile } from './entities/dev-report-file.entity';
 import * as fs from 'fs';
 import * as path from 'path';
 
-const SWEDISH_NAMES = [
-  'Arne', 'Bjorn', 'Carl', 'David', 'Erik', 'Fredrik', 'Gustav', 'Henrik',
-  'Ingvar', 'Johan', 'Karl', 'Lars', 'Magnus', 'Nils', 'Oscar', 'Per',
-  'Ragnar', 'Sven', 'Thomas', 'Ulf', 'Viktor', 'Wilhelm',
-  'Anna', 'Britt', 'Carin', 'Dagny', 'Eva', 'Frida', 'Greta', 'Hilda',
-  'Ingrid', 'Julia', 'Karin', 'Lisa', 'Maria', 'Nina', 'Olga', 'Petra',
+const DISPLAY_NAMES = [
+  'Alice', 'Blake', 'Charlie', 'David', 'Emma', 'Frank', 'Grace', 'Henry',
+  'Iris', 'Jack', 'Kate', 'Leo', 'Maya', 'Noah', 'Olivia', 'Paul',
+  'Quinn', 'Ruby', 'Sam', 'Tom', 'Uma', 'Vera', 'Will', 'Zara',
 ];
 
 @Injectable()
@@ -23,17 +21,17 @@ export class DevReportsService {
     private readonly fileRepo: Repository<DevReportFile>,
   ) {}
 
-  /** Generate a unique Swedish display ID like "Arne201" */
+  /** Generate a unique display ID like "Alice201" */
   private async generateDisplayId(): Promise<string> {
     for (let attempt = 0; attempt < 20; attempt++) {
-      const name = SWEDISH_NAMES[Math.floor(Math.random() * SWEDISH_NAMES.length)];
+      const name = DISPLAY_NAMES[Math.floor(Math.random() * DISPLAY_NAMES.length)];
       const num = Math.floor(Math.random() * 999) + 1;
       const displayId = `${name}${num}`;
       const exists = await this.repo.findOne({ where: { displayId } });
       if (!exists) return displayId;
     }
     // Fallback: name + timestamp suffix
-    const name = SWEDISH_NAMES[Math.floor(Math.random() * SWEDISH_NAMES.length)];
+    const name = DISPLAY_NAMES[Math.floor(Math.random() * DISPLAY_NAMES.length)];
     return `${name}${Date.now() % 100000}`;
   }
 
