@@ -1,6 +1,22 @@
-# AirKit
+# DevLoop
 
-Developer debugging, bug reporting, file sharing & database viewer toolkit for **NestJS + Next.js** applications.
+**AI-driven development loop: report, fix, review, ship.**
+
+DevLoop is a vibe coding toolkit that creates a real-time feedback loop between developers and AI — built directly into your application. Report bugs visually, AI fixes them, you review in-app, approve or send back. The loop continues until everything ships.
+
+## How It Works
+
+```
+You find a bug → Report it in-app (Ctrl+Shift+D or Ctrl+Shift+R)
+     ↓
+AI sees the report → Fixes the code → Posts in thread
+     ↓
+You review → Approve (Done) or reject (Not Solved)
+     ↓
+If rejected → AI reads your feedback → Fixes again
+     ↓
+Loop continues until shipped ✓
+```
 
 ## Features
 
@@ -23,6 +39,13 @@ Developer debugging, bug reporting, file sharing & database viewer toolkit for *
 - Activity log panel showing all captured events
 - Creates detailed sequence reports with all data
 
+### AI Review Loop
+- Thread-based communication between user and AI on each report
+- AI posts what was fixed and how
+- User approves (Done) or rejects (Not Solved) with feedback
+- Not Solved triggers AI to re-read feedback and try again
+- Complete audit trail of every fix attempt
+
 ### System Status
 - Real-time backend/frontend status indicator (online/offline)
 - Shows which bug report is currently being worked on
@@ -31,7 +54,7 @@ Developer debugging, bug reporting, file sharing & database viewer toolkit for *
 ### File Sharing
 - Upload, download, delete files
 - Copy full system path for easy reference
-- Shared across all users in the debug panel
+- Share screenshots, logs, and reference files
 
 ### Database Viewer
 - Interactive schema viewer with draggable table cards
@@ -41,7 +64,7 @@ Developer debugging, bug reporting, file sharing & database viewer toolkit for *
 ## Project Structure
 
 ```
-airkit/
+devloop/
 ├── backend/
 │   └── src/
 │       ├── dev-reports/          # Bug reports, threads, sequences, files
@@ -114,6 +137,17 @@ export default function Layout({ children }) {
 2. Add the debug and db pages to your routing.
 
 3. Install dependency: `npm install html2canvas`
+
+### AI Integration
+
+DevLoop works with any AI coding assistant (Claude Code, Cursor, GitHub Copilot, etc.). The AI needs to:
+
+1. Poll `GET /dev-reports` for reports with status `new` or `not-solved`
+2. Read the thread for user feedback
+3. Fix the code
+4. Post a comment via `POST /dev-reports/:id/thread`
+5. Set status to `in-progress`
+6. Wait for user to approve (`done`) or reject (`not-solved`)
 
 ## Keyboard Shortcuts
 
