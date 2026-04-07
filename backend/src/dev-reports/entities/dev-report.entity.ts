@@ -10,7 +10,7 @@ export class DevReport {
   @PrimaryGeneratedColumn('uuid')
   id!: string;
 
-  /** Human-friendly ID, e.g. "Alice201" */
+  /** Human-friendly ID, e.g. "Arne201" */
   @Column({ type: 'varchar', unique: true })
   displayId!: string;
 
@@ -60,6 +60,10 @@ export class DevReport {
   @Column({ type: 'jsonb', nullable: true })
   consoleErrors!: string[] | null;
 
+  /** Advanced debug info (CSS, rect, parents, API calls) */
+  @Column({ type: 'jsonb', nullable: true })
+  debugInfo!: Record<string, any> | null;
+
   /** Status: new, in-progress, done */
   @Column({ type: 'varchar', default: 'new' })
   status!: string;
@@ -86,6 +90,21 @@ export class DevReport {
   /** Activity logs captured during recording */
   @Column({ type: 'jsonb', nullable: true })
   activityLogs!: { timestamp: string; type: string; summary: string }[] | null;
+
+  /** Corrected version of description (spelling/grammar) */
+  @Column({ type: 'text', nullable: true })
+  correctedDescription!: string | null;
+
+  /** AI code review settings */
+  @Column({ type: 'boolean', default: false })
+  aiReviewEnabled!: boolean;
+
+  @Column({ type: 'varchar', nullable: true, default: 'gpt-4.1' })
+  aiReviewModel!: string | null;
+
+  /** AI review results: [{ round, score, feedback, model, timestamp }] */
+  @Column({ type: 'jsonb', nullable: true })
+  aiReviewResults!: { round: number; score: number; feedback: string; model: string; timestamp: string }[] | null;
 
   /** @deprecated Old comment field — kept for migration, use thread instead */
   @Column({ type: 'text', nullable: true })

@@ -22,6 +22,9 @@ export function DevModeOverlay() {
   const [reviewSelectedIdx, setReviewSelectedIdx] = useState<number | null>(null);
   const [reviewDescription, setReviewDescription] = useState('');
   const [reviewSubmitting, setReviewSubmitting] = useState(false);
+  const [formPos, setFormPos] = useState<{ x: number; y: number } | null>(null);
+  const [dragging, setDragging] = useState(false);
+  const dragOffset = useRef({ x: 0, y: 0 });
   const overlayRef = useRef<HTMLDivElement>(null);
   const recordingIntervalRef = useRef<any>(null);
 
@@ -48,7 +51,7 @@ export function DevModeOverlay() {
       addLog({
         timestamp: new Date().toISOString(),
         type: 'click',
-        summary: `Klick: <${tag}> "${text}" (${selector})`,
+        summary: `Click: <${tag}> "${text}" (${selector})`,
       });
     };
     window.addEventListener('click', handler, true);
@@ -79,7 +82,7 @@ export function DevModeOverlay() {
         addLog({
           timestamp: new Date().toISOString(),
           type: 'error',
-          summary: maskPhone(`${method} ${url} → FEL: ${err.message}`),
+          summary: maskPhone(`${method} ${url} → ERROR: ${err.message}`),
         });
         throw err;
       }
@@ -128,7 +131,7 @@ export function DevModeOverlay() {
         addLog({
           timestamp: new Date().toISOString(),
           type: 'navigation',
-          summary: `Navigerade till ${window.location.pathname}`,
+          summary: `Navigated to ${window.location.pathname}`,
         });
         lastUrl = window.location.href;
       }
@@ -245,20 +248,128 @@ export function DevModeOverlay() {
     };
   }, [state, onMouseMove, onClick]);
 
+  const [threadTarget, setThreadTarget] = useState('');
+
+  // Submit as thread message to existing report
+  const submitToThread = async () => {
+    if (!threadTarget.trim() || !description.trim()) return;
+    setSubmitting(true);
+    setState('submitting');
+    try {
+      // Capture screenshot
+      let screenshotBase64: string | null = null;
+      try {
+        const canvas = await html2canvas(document.documentElement, { useCORS: true, logging: false });
+        screenshotBase64 = canvas.toDataURL('image/png');
+      } catch {}
+
+      // Find report by displayId
+      const listRes = await fetch('/api/dev-reports', { credentials: 'same-origin' });
+      const reports = await listRes.json();
+      const target = reports.find((r: any) => r.displayId === threadTarget.trim());
+      if (!target) { alert(`Report "${threadTarget}" not found`); setSubmitting(false); setState('editing'); return; }
+
+      // Upload screenshot and get file path
+      let screenshotPath = '';
+      if (screenshotBase64) {
+        const uploadRes = await fetch('/api/dev-reports/files/upload', {
+          method: 'POST', credentials: 'same-origin',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ filename: `thread-${threadTarget}-${Date.now()}.png`, data: screenshotBase64 }),
+        });
+        const uploadData = await uploadRes.json();
+        screenshotPath = uploadData.filePath || '';
+      }
+
+      // Build full report text (like TXT file)
+      const fullText = [
+        `Addendum to: ${threadTarget}`,
+        `Date: ${new Date().toLocaleString('en-US')}`,
+        `Page: ${window.location.href}`,
+        '',
+        `Description:`,
+        description.trim(),
+        '',
+        `Element selector: ${selectedElement?.selector || '—'}`,
+        `Element text: ${selectedElement?.text?.slice(0, 200) || '—'}`,
+        `Component: ${selectedElement?.componentInfo || '—'}`,
+        `Viewport: ${window.innerWidth}x${window.innerHeight}`,
+        `Scroll: ${window.scrollX},${window.scrollY}`,
+        screenshotPath ? `Screenshot: ${screenshotPath}` : '',
+      ].filter(Boolean).join('\n');
+
+      await fetch(`/api/dev-reports/${target.id}/thread`, {
+        method: 'POST', credentials: 'same-origin',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ text: fullText, author: 'DevMode' }),
+      });
+
+      setLastSubmittedId(`→ ${threadTarget}`);
+      setDescription('');
+      setThreadTarget('');
+      setState('submitted');
+    } catch {
+      setState('selected');
+    }
+    setSubmitting(false);
+  };
+
+  // Collect advanced debug info for an element
+  const collectDebugInfo = (el: Element | null): Record<string, any> => {
+    if (!el) return {};
+    const info: Record<string, any> = {};
+    // CSS computed styles (key properties)
+    try {
+      const cs = window.getComputedStyle(el);
+      info.css = {
+        display: cs.display, position: cs.position,
+        width: cs.width, height: cs.height,
+        padding: cs.padding, margin: cs.margin,
+        fontSize: cs.fontSize, fontWeight: cs.fontWeight,
+        color: cs.color, background: cs.backgroundColor,
+        border: cs.border, borderRadius: cs.borderRadius,
+        overflow: cs.overflow, zIndex: cs.zIndex,
+      };
+    } catch {}
+    // Element size + position
+    try {
+      const rect = el.getBoundingClientRect();
+      info.rect = { x: Math.round(rect.x), y: Math.round(rect.y), w: Math.round(rect.width), h: Math.round(rect.height) };
+    } catch {}
+    // Parent chain (up to 4 levels)
+    try {
+      const parents: string[] = [];
+      let p = el.parentElement;
+      for (let i = 0; i < 4 && p; i++) {
+        parents.push(`${p.tagName.toLowerCase()}${p.className ? '.' + p.className.split(' ').slice(0, 2).join('.') : ''}`);
+        p = p.parentElement;
+      }
+      info.parentChain = parents;
+    } catch {}
+    // Recent API calls (from performance entries)
+    try {
+      const entries = performance.getEntriesByType('resource').filter((e: any) => e.name.includes('/api/')).slice(-5);
+      info.recentApiCalls = entries.map((e: any) => ({ url: e.name.split('/api/')[1], duration: Math.round(e.duration), status: e.responseStatus || '?' }));
+    } catch {}
+    return info;
+  };
+
   // Submit report
   const submitReport = async () => {
     if (!selectedElement || !description.trim()) return;
     setSubmitting(true);
     setState('submitting');
     try {
-      // Capture screenshot — keep dev overlay visible so marked element shows
+      // Capture screenshot
       let screenshotBase64: string | null = null;
       try {
         const canvas = await html2canvas(document.documentElement, { useCORS: true, logging: false });
         screenshotBase64 = canvas.toDataURL('image/png');
-      } catch {
-        // Screenshot failed — continue without it
-      }
+      } catch {}
+
+      // Collect advanced debug info
+      const targetEl = selectedElement.selector ? document.querySelector(selectedElement.selector) : null;
+      const debugInfo = collectDebugInfo(targetEl);
 
       const res = await fetch('/api/dev-reports', {
         method: 'POST',
@@ -275,6 +386,7 @@ export function DevModeOverlay() {
           userAgent: navigator.userAgent,
           consoleErrors: captureConsoleErrors(),
           screenshot: screenshotBase64,
+          debugInfo,
         }),
       });
       const data = await res.json();
@@ -397,7 +509,7 @@ export function DevModeOverlay() {
           <textarea
             value={reviewDescription}
             onChange={(e) => setReviewDescription(e.target.value)}
-            placeholder="Describe what you tested..."
+            placeholder="Describe what you were testing..."
             rows={2}
             style={{ width: '100%', padding: 10, borderRadius: 8, border: '1px solid rgba(255,255,255,0.2)', background: 'rgba(255,255,255,0.1)', color: '#fff', fontSize: 13, resize: 'none', fontFamily: 'inherit' }}
           />
@@ -409,7 +521,7 @@ export function DevModeOverlay() {
           <div style={{ width: 180, borderRight: '1px solid rgba(255,255,255,0.1)', overflow: 'auto', padding: 8 }}>
             {recordingFrames.map((f, i) => {
               const ts = new Date(f.timestamp);
-              const t = ts.toLocaleTimeString('sv-SE', { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+              const t = ts.toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', second: '2-digit' });
               return (
                 <div
                   key={i}
@@ -459,7 +571,7 @@ export function DevModeOverlay() {
                         display: 'flex', alignItems: 'center', justifyContent: 'center',
                         border: '2px solid #fff', cursor: 'pointer', boxShadow: '0 2px 8px rgba(0,0,0,0.4)',
                       }}
-                      title={a.comment || 'Klicka för att ta bort'}
+                      title={a.comment || 'Click to remove'}
                       onClick={(e) => { e.stopPropagation(); removeAnnotation(reviewSelectedIdx, ai); }}
                     >
                       {ai + 1}
@@ -494,7 +606,7 @@ export function DevModeOverlay() {
                   <textarea
                     value={recordingFrames[reviewSelectedIdx].comment}
                     onChange={(e) => setFrameComment(reviewSelectedIdx, e.target.value)}
-                    placeholder="Comment for this frame (optional)..."
+                    placeholder="General comment for this frame (optional)..."
                     rows={2}
                     style={{ width: '100%', padding: 8, borderRadius: 6, border: '1px solid rgba(255,255,255,0.2)', background: 'rgba(255,255,255,0.1)', color: '#fff', fontSize: 12, resize: 'none', fontFamily: 'inherit' }}
                   />
@@ -514,8 +626,8 @@ export function DevModeOverlay() {
               </>
             ) : (
               <div style={{ color: 'rgba(255,255,255,0.4)', fontSize: 14, textAlign: 'center', marginTop: 40 }}>
-                Klicka på en bild till vänster för att granska<br />
-                Klicka på bilden för att placera markörer
+                Click on an image to the left to review<br />
+                Click on the image to place markers
               </div>
             )}
           </div>
@@ -527,7 +639,7 @@ export function DevModeOverlay() {
             </div>
             {recordingLogs.map((log, i) => {
               const ts = new Date(log.timestamp);
-              const t = ts.toLocaleTimeString('sv-SE', { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+              const t = ts.toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', second: '2-digit' });
               const colors: Record<string, string> = { click: '#60a5fa', api: '#a78bfa', call: '#34d399', sms: '#fbbf24', error: '#f87171', navigation: '#94a3b8' };
               return (
                 <div key={i} style={{ fontSize: 10, padding: '3px 4px', borderBottom: '1px solid rgba(255,255,255,0.05)', color: 'rgba(255,255,255,0.6)' }}>
@@ -569,7 +681,7 @@ export function DevModeOverlay() {
         display: 'flex', justifyContent: 'space-between', alignItems: 'center',
         pointerEvents: 'auto', zIndex: OVERLAY_Z + 1,
       }}>
-        <span>DEV MODE — Klicka på element för att rapportera</span>
+        <span>DEV MODE — Click on an element to report</span>
         <div style={{ display: 'flex', gap: 8 }}>
           <button onClick={toggleSidebar} style={{ background: 'rgba(255,255,255,0.2)', border: 'none', color: '#fff', padding: '2px 8px', borderRadius: 4, cursor: 'pointer', fontSize: 11, fontWeight: 600 }}>
             Reports
@@ -624,11 +736,11 @@ export function DevModeOverlay() {
             zIndex: OVERLAY_Z + 2,
           }} />
 
-          {/* Report form */}
+          {/* Report form (draggable — grab the top bar) */}
           <div ref={overlayRef} style={{
             position: 'fixed',
-            top: Math.min(selectedElement.rect.top + selectedElement.rect.height + 8, window.innerHeight - 220),
-            left: Math.min(selectedElement.rect.left, window.innerWidth - 340),
+            top: formPos ? formPos.y : Math.min(selectedElement.rect.top + selectedElement.rect.height + 8, window.innerHeight - 280),
+            left: formPos ? formPos.x : Math.min(selectedElement.rect.left, window.innerWidth - 340),
             width: 320,
             background: '#fff', borderRadius: 8,
             boxShadow: '0 8px 32px rgba(0,0,0,0.25)',
@@ -636,12 +748,28 @@ export function DevModeOverlay() {
             padding: 12,
             pointerEvents: 'auto',
             zIndex: OVERLAY_Z + 4,
-          }}>
+            cursor: dragging ? 'grabbing' : undefined,
+          }}
+          onMouseDown={(e) => {
+            if ((e.target as HTMLElement).tagName === 'TEXTAREA' || (e.target as HTMLElement).tagName === 'BUTTON') return;
+            setDragging(true);
+            const rect = (e.currentTarget as HTMLElement).getBoundingClientRect();
+            dragOffset.current = { x: e.clientX - rect.left, y: e.clientY - rect.top };
+            const onMove = (ev: MouseEvent) => setFormPos({ x: ev.clientX - dragOffset.current.x, y: ev.clientY - dragOffset.current.y });
+            const onUp = () => { setDragging(false); window.removeEventListener('mousemove', onMove); window.removeEventListener('mouseup', onUp); };
+            window.addEventListener('mousemove', onMove);
+            window.addEventListener('mouseup', onUp);
+          }}
+          >
+            {/* Drag handle */}
+            <div style={{ display: 'flex', justifyContent: 'center', cursor: 'grab', padding: '2px 0 4px', marginBottom: 4 }}>
+              <div style={{ width: 32, height: 4, borderRadius: 2, background: '#d1d5db' }} />
+            </div>
             {state === 'submitted' && lastSubmittedId ? (
               <div style={{ textAlign: 'center', padding: 8 }}>
                 <div style={{ fontSize: 14, fontWeight: 700, color: '#28a745', marginBottom: 4 }}>Report submitted!</div>
                 <div style={{ fontSize: 20, fontWeight: 800, color: '#1a1a2e', marginBottom: 8 }}>{lastSubmittedId}</div>
-                <div style={{ fontSize: 11, color: '#666', marginBottom: 12 }}>Referera till detta ID i chatten</div>
+                <div style={{ fontSize: 11, color: '#666', marginBottom: 12 }}>Reference this ID in the chat</div>
                 <div style={{ display: 'flex', gap: 6 }}>
                   <button onClick={clearSelection} style={{ flex: 1, padding: '6px 0', borderRadius: 6, background: '#3b82f6', color: '#fff', border: 'none', cursor: 'pointer', fontSize: 12, fontWeight: 600 }}>
                     New report
@@ -678,6 +806,45 @@ export function DevModeOverlay() {
                   }}
                   onKeyDown={(e) => { if (e.key === 'Enter' && e.metaKey) submitReport(); }}
                 />
+                <div style={{ fontSize: 10, color: '#1a1a2e', marginTop: 4, lineHeight: 1.5 }}>
+                  <div>Text: &quot;{selectedElement?.text?.slice(0, 40) || ''}&quot;</div>
+                  <div>URL: {window.location.pathname}</div>
+                </div>
+                <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginTop: 6, flexWrap: 'wrap' }}>
+                  <label style={{ display: 'flex', alignItems: 'center', gap: 3, fontSize: 11, color: '#374151', cursor: 'pointer' }}>
+                    <input type="checkbox" defaultChecked={false} id="devmode-chatgpt" /> ChatGPT
+                  </label>
+                  <select defaultValue="gpt-4.1" id="devmode-model" style={{ padding: '1px 4px', borderRadius: 3, border: '1px solid #d9dde5', fontSize: 10 }}>
+                    <option value="gpt-4.1">GPT-5.4</option>
+                    <option value="gpt-4o">GPT-4</option>
+                    <option value="gpt-4o-mini">Mini</option>
+                  </select>
+                  <select defaultValue="medium" id="devmode-reasoning" style={{ padding: '1px 4px', borderRadius: 3, border: '1px solid #d9dde5', fontSize: 10 }}>
+                    <option value="low">Low</option>
+                    <option value="medium">Medium</option>
+                    <option value="high">High</option>
+                    <option value="xhigh">xHigh</option>
+                  </select>
+                </div>
+                {/* Add to existing thread */}
+                <div style={{ display: 'flex', alignItems: 'center', gap: 4, marginTop: 6 }}>
+                  <input
+                    type="text"
+                    value={threadTarget}
+                    onChange={e => setThreadTarget(e.target.value)}
+                    placeholder="Add to thread (e.g. Ulf318)"
+                    style={{ flex: 1, padding: '4px 6px', borderRadius: 4, border: '1px solid #d9dde5', fontSize: 11 }}
+                  />
+                  {threadTarget.trim() && (
+                    <button
+                      onClick={submitToThread}
+                      disabled={submitting || !description.trim()}
+                      style={{ padding: '4px 8px', borderRadius: 4, background: '#6366f1', color: '#fff', border: 'none', cursor: 'pointer', fontSize: 11, fontWeight: 600, whiteSpace: 'nowrap' }}
+                    >
+                      → Thread
+                    </button>
+                  )}
+                </div>
                 <div style={{ display: 'flex', gap: 6, marginTop: 6 }}>
                   <button
                     onClick={submitReport}

@@ -1,4 +1,4 @@
-import { Controller, Post, Get, Patch, Delete, Body, Param, Req, Res, UseGuards, NotFoundException } from '@nestjs/common';
+import { Controller, Post, Get, Put, Patch, Delete, Body, Param, Req, Res, UseGuards, NotFoundException } from '@nestjs/common';
 import { JwtAuthGuard } from '../common/guards/jwt-auth.guard';
 import { DevReportsService } from './dev-reports.service';
 import * as fs from 'fs';
@@ -40,6 +40,7 @@ export class DevReportsController {
       scrollPosition: body.scrollPosition || null,
       userAgent: body.userAgent || null,
       consoleErrors: body.consoleErrors || null,
+      debugInfo: body.debugInfo || null,
     });
     return { displayId: report.displayId, id: report.id };
   }
@@ -57,7 +58,40 @@ export class DevReportsController {
     });
   }
 
-  /* ── Shared Files ────────────────────────────────────────────────────── */
+  /* -- AI Code Review ---------------------------------------------------- */
+
+  @Post(':id/ai-review')
+  async runAiReview(@Param('id') id: string, @Body() body: { codeDiff: string }) {
+    return this.service.runAiReview(id, body.codeDiff);
+  }
+
+  @Put(':id/ai-review-toggle')
+  async toggleAiReview(@Param('id') id: string, @Body() body: { enabled: boolean; model?: string }) {
+    return this.service.toggleAiReview(id, body.enabled, body.model);
+  }
+
+  /* -- Feature Ideas ----------------------------------------------------- */
+
+  @Get('ideas')
+  async listIdeas() { return this.service.listIdeas(); }
+
+  @Post('ideas')
+  async createIdea(@Body() body: any, @Req() req: any) {
+    return this.service.createIdea({
+      description: body.description || '',
+      pageUrl: body.pageUrl || undefined,
+      imagePath: body.imagePath || undefined,
+      createdBy: req.user?.email || body.createdBy || undefined,
+    });
+  }
+
+  @Delete('ideas/:id')
+  async deleteIdea(@Param('id') id: string) { await this.service.deleteIdea(id); return { deleted: true }; }
+
+  @Post('ideas/:id/convert')
+  async convertIdea(@Param('id') id: string) { return this.service.convertIdeaToTask(id); }
+
+  /* -- Shared Files ------------------------------------------------------ */
 
   @Get('files')
   async listFiles() {
@@ -68,6 +102,21 @@ export class DevReportsController {
   async uploadFile(@Body() body: { filename: string; data: string }, @Req() req: any) {
     const uploadedBy = req.user?.email || null;
     return this.service.uploadFile(body.filename, body.data, uploadedBy);
+  }
+
+  @Post('files/upload-multipart')
+  async uploadFileMultipart(@Req() req: any) {
+    const uploadedBy = req.user?.email || null;
+    const data = await req.file();
+    if (!data) throw new NotFoundException('No file in request');
+    const uploadsDir = path.join(process.cwd(), 'uploads', 'dev-files');
+    fs.mkdirSync(uploadsDir, { recursive: true });
+    const safeFilename = `${Date.now()}-${(data.filename || 'file').replace(/[^a-zA-Z0-9._-]/g, '_')}`;
+    const filePath = path.join(uploadsDir, safeFilename);
+    const chunks: Buffer[] = [];
+    for await (const chunk of data.file) { chunks.push(chunk); }
+    fs.writeFileSync(filePath, Buffer.concat(chunks));
+    return this.service.saveFileRecord(data.filename || 'file', `uploads/dev-files/${safeFilename}`, uploadedBy);
   }
 
   @Get('files/:id/download')
@@ -156,14 +205,19 @@ export class DevReportsController {
     return this.service.findByDisplayId(displayId);
   }
 
+  @Delete(':id/thread/:index')
+  async deleteThreadComment(@Param('id') id: string, @Param('index') index: string) {
+    return this.service.deleteThreadComment(id, parseInt(index, 10));
+  }
+
   @Post(':id/thread')
   async addThreadComment(@Param('id') id: string, @Body() body: { author: string; text: string }, @Req() req: any) {
-    const author = body.author || req.user?.email || 'Okänd';
+    const author = body.author || req.user?.email || 'Unknown';
     return this.service.addThreadComment(id, author, body.text);
   }
 
   @Patch(':id')
-  async updateReport(@Param('id') id: string, @Body() body: { status?: string; assignee?: string; comment?: string; description?: string }) {
+  async updateReport(@Param('id') id: string, @Body() body: { status?: string; assignee?: string; comment?: string; description?: string; correctedDescription?: string }) {
     return this.service.updateReport(id, body);
   }
 
