@@ -1,7 +1,7 @@
 {
   "name": "@devloop/api",
-  "version": "0.1.0",
-  "description": "DevLoop central Public API — NestJS 11 + Fastify 5. Fas 0.1 scaffolding.",
+  "version": "0.2.0",
+  "description": "DevLoop central Public API — NestJS 11 + Fastify 5. Fas 0.2 DB foundation.",
   "private": true,
   "license": "UNLICENSED",
   "engines": {
@@ -11,18 +11,24 @@
     "build": "tsc -p tsconfig.build.json",
     "start": "node dist/main.js",
     "dev": "ts-node src/main.ts",
-    "typecheck": "tsc -p tsconfig.json --noEmit"
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "migration:run": "ts-node src/migrations/run.ts up",
+    "migration:revert": "ts-node src/migrations/run.ts down",
+    "migration:status": "ts-node src/migrations/run.ts status"
   },
   "dependencies": {
     "@nestjs/common": "^11.1.18",
     "@nestjs/core": "^11.1.18",
     "@nestjs/platform-fastify": "^11.1.18",
     "fastify": "^5.8.4",
+    "pg": "^8.13.0",
     "reflect-metadata": "^0.2.2",
-    "rxjs": "^7.8.1"
+    "rxjs": "^7.8.1",
+    "typeorm": "^0.3.20"
   },
   "devDependencies": {
     "@types/node": "^22.7.0",
+    "@types/pg": "^8.11.10",
     "ts-node": "^10.9.2",
     "typescript": "^5.5.4"
   }
