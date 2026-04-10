@@ -345,7 +345,7 @@ Each service is a separate systemd unit running as a separate OS user with a sep
 
 #### 3.1.2 Public API — `runtime/api/`
 
-- NestJS 10 + Fastify
+- NestJS 11 + Fastify 5
 - User: `devloop-api`
 - Listens: `127.0.0.1:3100` (loopback only)
 - Modules: `auth`, `projects`, `reports` (intake + list), `dashboard-api`, `health-monitor` (read-only UI), `compliance` (branch-protection checks), `host-deploy-api` (serves desired-state polling and apply-status reporting for host deploy agents)
