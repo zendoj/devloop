@@ -1,14 +1,16 @@
 import { Module } from '@nestjs/common';
+import { AuthModule } from './auth/auth.module';
+import { SecretsService } from './config/secrets.service';
+import { DbModule } from './db/db.module';
 import { HealthController } from './health/health.controller';
 
 /**
- * Root module. Fas 0.1 scaffolding.
- * Additional feature modules (auth, projects, reports, orchestrator, ...)
- * are added in later phases per ARCHITECTURE.md §3.1.2.
+ * Root module. Fas 0.9 wires the DB data source, file-backed secrets,
+ * and auth.
  */
 @Module({
-  imports: [],
+  imports: [DbModule, AuthModule],
   controllers: [HealthController],
-  providers: [],
+  providers: [SecretsService],
 })
 export class AppModule {}

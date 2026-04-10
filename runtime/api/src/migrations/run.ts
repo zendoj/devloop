@@ -1,5 +1,5 @@
 import 'reflect-metadata';
-import { dataSource } from '../data-source';
+import { buildDataSource } from '../data-source';
 
 /**
  * Migration CLI entry point.
@@ -41,6 +41,7 @@ async function main(): Promise<void> {
   }
 
   const command = parseCommand(process.argv);
+  const dataSource = buildDataSource();
 
   try {
     await dataSource.initialize();

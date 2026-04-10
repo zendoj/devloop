@@ -1,4 +1,5 @@
 import 'reflect-metadata';
+import fastifyCookie from '@fastify/cookie';
 import { NestFactory } from '@nestjs/core';
 import {
   FastifyAdapter,
@@ -77,6 +78,12 @@ async function bootstrap(): Promise<void> {
       logger: ['log', 'warn', 'error'],
     },
   );
+
+  // @fastify/cookie provides req.cookies parsing. No cookie signing key
+  // is configured — the devloop_session cookie is an opaque random token
+  // whose authenticity is proven by a DB lookup against its SHA-256
+  // hash, not by HMAC signing.
+  await app.register(fastifyCookie as never);
 
   await app.listen(port, host);
   // eslint-disable-next-line no-console

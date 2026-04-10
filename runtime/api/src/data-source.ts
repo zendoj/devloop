@@ -61,6 +61,10 @@ function readDataSourceOptions(): DataSourceOptions {
   };
 }
 
-export const dataSourceOptions = readDataSourceOptions();
+export function buildDataSourceOptions(): DataSourceOptions {
+  return readDataSourceOptions();
+}
 
-export const dataSource = new DataSource(dataSourceOptions);
+export function buildDataSource(): DataSource {
+  return new DataSource(readDataSourceOptions());
+}
