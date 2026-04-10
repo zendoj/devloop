@@ -61,11 +61,31 @@ async function run(ds: DataSource): Promise<void> {
   const { SessionService } = await import('../src/auth/services/session.service');
   const { AuthService } = await import('../src/auth/services/auth.service');
 
+  const { SecretsService } = await import('../src/config/secrets.service');
+  const { TotpService } = await import('../src/auth/services/totp.service');
+  const { DataEncryptionService } = await import('../src/auth/services/data-encryption.service');
+  const { Challenge2faService } = await import('../src/auth/services/challenge-2fa.service');
+
+  const secrets = new SecretsService();
+  await secrets.onModuleInit();
   const passwords = new PasswordService();
   const sessions = new SessionService(ds);
-  const auth = new AuthService(ds, passwords, sessions);
+  const totp = new TotpService();
+  const dataEnc = new DataEncryptionService(secrets);
+  dataEnc.onModuleInit();
+  const challenges = new Challenge2faService(secrets);
+  challenges.onModuleInit();
+  const auth = new AuthService(ds, passwords, sessions, totp, dataEnc, challenges);
   // Mimic Nest's lifecycle: onModuleInit precomputes the dummy hash.
   await auth.onModuleInit();
+
+  // Ensure the test user is NOT 2FA-enrolled so login returns
+  // { kind: 'session' } — this legacy smoke suite targets the
+  // password-only path.
+  await ds.query(
+    `UPDATE public.users SET two_factor_enrolled = false, two_factor_secret = NULL WHERE email = $1::citext`,
+    [TEST_EMAIL],
+  );
 
   // --- Test 1: wrong password fails ---
   console.log('[smoke] TEST 1: bad password rejected');
@@ -82,7 +102,11 @@ async function run(ds: DataSource): Promise<void> {
 
   // --- Test 2: correct password returns a session ---
   console.log('[smoke] TEST 2: good password creates session');
-  const session = await auth.login(TEST_EMAIL, TEST_PASSWORD, '127.0.0.1', 'smoke');
+  const outcome = await auth.login(TEST_EMAIL, TEST_PASSWORD, '127.0.0.1', 'smoke');
+  if (outcome.kind !== 'session') {
+    throw new Error(`FAIL: expected session, got ${outcome.kind}`);
+  }
+  const session = outcome.session;
   if (typeof session.token !== 'string' || session.token.length < 40) {
     throw new Error(`FAIL: bad token shape ${session.token}`);
   }
@@ -156,7 +180,11 @@ async function run(ds: DataSource): Promise<void> {
 
   // --- Test 8: token_hash in DB is SHA-256 of raw bytes, not the token ---
   console.log('[smoke] TEST 8: DB stores hash, not raw token');
-  const session2 = await auth.login(TEST_EMAIL, TEST_PASSWORD, '127.0.0.1', 'smoke');
+  const outcome2 = await auth.login(TEST_EMAIL, TEST_PASSWORD, '127.0.0.1', 'smoke');
+  if (outcome2.kind !== 'session') {
+    throw new Error('FAIL: expected session');
+  }
+  const session2 = outcome2.session;
   const { createHash } = await import('node:crypto');
   const expectedHash = createHash('sha256')
     .update(Buffer.from(session2.token, 'base64url'))

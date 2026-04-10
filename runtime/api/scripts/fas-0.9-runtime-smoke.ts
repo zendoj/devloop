@@ -33,14 +33,31 @@ async function main(): Promise<void> {
 }
 
 async function run(ds: DataSource): Promise<void> {
+  const { SecretsService } = await import('../src/config/secrets.service');
   const { PasswordService } = await import('../src/auth/services/password.service');
   const { SessionService } = await import('../src/auth/services/session.service');
+  const { TotpService } = await import('../src/auth/services/totp.service');
+  const { DataEncryptionService } = await import('../src/auth/services/data-encryption.service');
+  const { Challenge2faService } = await import('../src/auth/services/challenge-2fa.service');
   const { AuthService } = await import('../src/auth/services/auth.service');
 
+  const secrets = new SecretsService();
+  await secrets.onModuleInit();
   const passwords = new PasswordService();
   const sessions = new SessionService(ds);
-  const auth = new AuthService(ds, passwords, sessions);
+  const totp = new TotpService();
+  const dataEnc = new DataEncryptionService(secrets);
+  dataEnc.onModuleInit();
+  const challenges = new Challenge2faService(secrets);
+  challenges.onModuleInit();
+  const auth = new AuthService(ds, passwords, sessions, totp, dataEnc, challenges);
   await auth.onModuleInit();
+
+  // Legacy runtime-smoke targets the password-only path.
+  await ds.query(
+    `UPDATE public.users SET two_factor_enrolled = false, two_factor_secret = NULL WHERE email = $1::citext`,
+    [TEST_EMAIL],
+  );
 
   console.log('[runtime-smoke] Setting a valid Argon2 hash for the test user (via rehash path)');
   // The user was seeded with a placeholder hash that Argon2 cannot
@@ -58,7 +75,11 @@ async function run(ds: DataSource): Promise<void> {
   );
 
   console.log('[runtime-smoke] TEST A: login under devloop_api role');
-  const session = await auth.login(TEST_EMAIL, TEST_PASSWORD, '127.0.0.1', 'runtime-smoke');
+  const outcome = await auth.login(TEST_EMAIL, TEST_PASSWORD, '127.0.0.1', 'runtime-smoke');
+  if (outcome.kind !== 'session') {
+    throw new Error(`FAIL: expected session, got ${outcome.kind}`);
+  }
+  const session = outcome.session;
   console.log(`[runtime-smoke]   OK: session_id=${session.sessionId}`);
 
   console.log('[runtime-smoke] TEST B: failed login increments counter under devloop_api');
