@@ -17,7 +17,7 @@
     "migration:status": "ts-node src/migrations/run.ts status"
   },
   "dependencies": {
-    "@fastify/cookie": "^9.4.0",
+    "@fastify/cookie": "^11.0.2",
     "@nestjs/common": "^11.1.18",
     "@nestjs/core": "^11.1.18",
     "@nestjs/platform-fastify": "^11.1.18",

@@ -13,7 +13,9 @@ import { AppModule } from './app.module';
 // is resolver-dependent (/etc/hosts, systemd-resolved) and could bind ::1 on some
 // systems. Later phases do not loosen this unless the deployment contract changes.
 const REQUIRED_HOST = '127.0.0.1';
-const DEFAULT_PORT = 3100;
+// 3100 is in use on this host by an unrelated CMS process; DevLoop
+// uses 3110 to avoid the collision. Override via DEVLOOP_API_PORT.
+const DEFAULT_PORT = 3110;
 
 async function bootstrap(): Promise<void> {
   // Fail-closed sync guard. NODE_ENV must be EXPLICITLY 'development' to allow
