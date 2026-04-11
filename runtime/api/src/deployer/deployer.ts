@@ -116,6 +116,27 @@ interface VerifyingTask {
   applied_status: string | null;
 }
 
+interface FailingTask {
+  task_id: string;
+  display_id: string;
+  project_id: string;
+  lease_version: number;
+  approved_base_sha: string;
+  merged_commit_sha: string;
+  default_branch: string;
+  applied_status: string;
+}
+
+interface RollingBackTask {
+  task_id: string;
+  display_id: string;
+  lease_version: number;
+  rollback_desired_state_id: string;
+  applied_status: string | null;
+  rollback_target_sha: string;
+  applied_sha: string | null;
+}
+
 async function main(): Promise<void> {
   console.log(`[dp] starting deployer ${DEPLOYER_ID}`);
   if (ACTIVE_KEY_ID.length === 0 || SIGNING_KEY === null) {
@@ -143,6 +164,8 @@ async function main(): Promise<void> {
       try {
         await deployApproved(ds);
         await verifyVerifying(ds);
+        await rollbackFailing(ds);
+        await verifyRollback(ds);
       } catch (err) {
         console.error('[dp] iteration error:', err);
       }
@@ -378,6 +401,248 @@ async function verifyVerifying(ds: DataSource): Promise<void> {
       console.log(`[dp] ${t.display_id} → verified ✓`);
     } catch (err) {
       console.error(`[dp] ${t.display_id} verify transition failed:`, err);
+    }
+  }
+}
+
+/**
+ * Fas B4 — rollback trigger.
+ *
+ * Polls tasks in 'verifying' whose linked applied_desired_state
+ * has applied_status IN ('failed','timed_out'). For each such
+ * task we:
+ *
+ *   1. Build a new signed desired_state with action='rollback',
+ *      deploy_sha = task.approved_base_sha (the SHA the branch
+ *      was based on, i.e. the pre-change state we want to
+ *      restore), base_sha = task.merged_commit_sha (the failed
+ *      deploy the host is currently sitting on).
+ *   2. Record it via record_desired_state inside a transaction
+ *      that also fences the task verifying → rolling_back with
+ *      rollback_desired_state_id in the payload. Mutex + lock
+ *      stay held (per state machine).
+ *
+ * The host agent will pick up the new rollback row the same way
+ * it picks up deploys — a rollback is just a signed desired_state
+ * with a different action. `verifyRollback()` below watches for
+ * the host's result and transitions rolling_back → rolled_back
+ * or → rollback_failed.
+ */
+async function rollbackFailing(ds: DataSource): Promise<void> {
+  const rows = (await ds.query(
+    `
+    SELECT
+      at.id                   AS task_id,
+      at.display_id,
+      at.project_id,
+      at.lease_version,
+      at.approved_base_sha,
+      at.merged_commit_sha,
+      p.github_default_branch AS default_branch,
+      dsh.applied_status::text AS applied_status
+    FROM public.agent_tasks at
+    JOIN public.projects p              ON p.id  = at.project_id
+    JOIN public.desired_state_history dsh ON dsh.id = at.applied_desired_state_id
+    WHERE at.status = 'verifying'
+      AND dsh.applied_status IN ('failed', 'timed_out')
+      AND at.approved_base_sha IS NOT NULL
+      AND at.merged_commit_sha IS NOT NULL
+    ORDER BY at.created_at ASC
+    LIMIT $1
+    `,
+    [VERIFY_POLL_LIMIT],
+  )) as Array<FailingTask>;
+
+  for (const t of rows) {
+    if (!running) break;
+    try {
+      await rollbackOne(ds, t);
+    } catch (err) {
+      console.error(`[dp] ${t.display_id} rollback trigger failed:`, err);
+    }
+  }
+}
+
+async function rollbackOne(ds: DataSource, t: FailingTask): Promise<void> {
+  console.log(
+    `[dp] ${t.display_id} host reported ${t.applied_status} for ${t.merged_commit_sha.slice(0, 7)} — rolling back to ${t.approved_base_sha.slice(0, 7)}`,
+  );
+
+  // Sign the rollback desired_state OUTSIDE the transaction —
+  // same ordering rationale as deployOne: the lock window on
+  // agent_tasks stays as short as possible.
+  const issuedAt = new Date().toISOString();
+  const desired = {
+    project_id: t.project_id,
+    deploy_sha: t.approved_base_sha,
+    base_sha: t.merged_commit_sha,
+    action: 'rollback',
+    target_branch: t.default_branch,
+    signing_key_id: ACTIVE_KEY_ID,
+    issued_at: issuedAt,
+  };
+  const canonical = jcs(desired);
+  const signedBytes = Buffer.from(canonical, 'utf8');
+  const signature = cryptoSign(null, signedBytes, SIGNING_KEY!);
+  if (signature.length !== 64) {
+    throw new Error(`bad ed25519 signature length ${signature.length}`);
+  }
+
+  await ds.transaction(async (m) => {
+    // Step 1: record the rollback desired_state first so we have
+    // its id to stamp into the task row on the fence transition.
+    const r1 = (await m.query(
+      `
+      SELECT public.record_desired_state(
+        $1::uuid,
+        $2::varchar(64),
+        $3::varchar(64),
+        'rollback'::public.desired_action_enum,
+        $4::varchar(128),
+        $5::varchar(64),
+        $6::bytea,
+        $7::bytea,
+        $8::uuid,
+        NULL::uuid
+      ) AS desired_state_id
+      `,
+      [
+        t.project_id,
+        t.approved_base_sha,
+        t.merged_commit_sha,
+        t.default_branch,
+        ACTIVE_KEY_ID,
+        signedBytes,
+        signature,
+        t.task_id,
+      ],
+    )) as Array<{ desired_state_id: string }>;
+    const rollbackDsi = r1[0]?.desired_state_id;
+    if (!rollbackDsi) {
+      throw new Error('record_desired_state(rollback) returned no id');
+    }
+
+    // Step 2: verifying → rolling_back with rollback id stamped.
+    await m.query(
+      `
+      SELECT public.fence_and_transition(
+        $1, $2::bigint, 'verifying'::public.task_status_enum,
+        'rolling_back'::public.task_status_enum,
+        $3::varchar(128), 'system'::public.actor_kind_enum,
+        jsonb_build_object(
+          'rollback_desired_state_id', $4::text,
+          'failure_reason', $5::text
+        ),
+        $3::varchar(128)
+      )
+      `,
+      [
+        t.task_id,
+        t.lease_version,
+        DEPLOYER_ID,
+        rollbackDsi,
+        `host reported applied_status=${t.applied_status} on ${t.merged_commit_sha}`,
+      ],
+    );
+  });
+
+  console.log(
+    `[dp] ${t.display_id} → rolling_back (rollback desired_state queued)`,
+  );
+}
+
+/**
+ * Fas B4 — rollback verifier.
+ *
+ * Mirrors verifyVerifying() for tasks in 'rolling_back'. Reads
+ * the rollback desired_state's applied_status:
+ *
+ *   - 'success' AND applied_sha = rollback's deploy_sha
+ *     → fence rolling_back → rolled_back (terminal).
+ *   - 'failed' OR 'timed_out'
+ *     → fence rolling_back → rollback_failed (§19 D5: lock +
+ *       mutex SEALED to infinity until operator recovery).
+ *
+ * A 'success' where applied_sha does not match is treated like a
+ * failure: the host reported success but on the wrong SHA, which
+ * means rollback did not actually happen. rollback_failed is
+ * safer than rolled_back here.
+ */
+async function verifyRollback(ds: DataSource): Promise<void> {
+  const rows = (await ds.query(
+    `
+    SELECT
+      at.id                         AS task_id,
+      at.display_id,
+      at.lease_version,
+      at.rollback_desired_state_id,
+      dsh.applied_status::text      AS applied_status,
+      dsh.deploy_sha                AS rollback_target_sha,
+      dsh.applied_sha               AS applied_sha
+    FROM public.agent_tasks at
+    JOIN public.desired_state_history dsh ON dsh.id = at.rollback_desired_state_id
+    WHERE at.status = 'rolling_back'
+      AND dsh.applied_status IS NOT NULL
+    ORDER BY at.created_at ASC
+    LIMIT $1
+    `,
+    [VERIFY_POLL_LIMIT],
+  )) as Array<RollingBackTask>;
+
+  for (const t of rows) {
+    if (!running) break;
+    const success =
+      t.applied_status === 'success' &&
+      t.applied_sha !== null &&
+      t.applied_sha === t.rollback_target_sha;
+    const failed =
+      t.applied_status === 'failed' ||
+      t.applied_status === 'timed_out' ||
+      (t.applied_status === 'success' && !success);
+
+    try {
+      if (success) {
+        await ds.query(
+          `
+          SELECT public.fence_and_transition(
+            $1, $2::bigint, 'rolling_back'::public.task_status_enum,
+            'rolled_back'::public.task_status_enum,
+            $3::varchar(128), 'system'::public.actor_kind_enum,
+            jsonb_build_object(
+              'rollback_commit_sha', $4::text
+            ),
+            $3::varchar(128)
+          )
+          `,
+          [t.task_id, t.lease_version, DEPLOYER_ID, t.applied_sha],
+        );
+        console.log(`[dp] ${t.display_id} → rolled_back ↩`);
+      } else if (failed) {
+        await ds.query(
+          `
+          SELECT public.fence_and_transition(
+            $1, $2::bigint, 'rolling_back'::public.task_status_enum,
+            'rollback_failed'::public.task_status_enum,
+            $3::varchar(128), 'system'::public.actor_kind_enum,
+            jsonb_build_object(
+              'failure_reason', $4::text
+            ),
+            $3::varchar(128)
+          )
+          `,
+          [
+            t.task_id,
+            t.lease_version,
+            DEPLOYER_ID,
+            `rollback apply ${t.applied_status}: host applied_sha=${t.applied_sha ?? 'null'} expected=${t.rollback_target_sha}`,
+          ],
+        );
+        console.warn(
+          `[dp] ${t.display_id} → rollback_failed (${t.applied_status}, applied_sha=${t.applied_sha ?? 'null'})`,
+        );
+      }
+    } catch (err) {
+      console.error(`[dp] ${t.display_id} rollback verify failed:`, err);
     }
   }
 }
