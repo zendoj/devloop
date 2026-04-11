@@ -2,7 +2,9 @@ import { Module } from '@nestjs/common';
 import { AuthModule } from './auth/auth.module';
 import { ConfigModule } from './config/config.module';
 import { DbModule } from './db/db.module';
+import { AgentsModule } from './agents/agents.module';
 import { DbSchemaModule } from './db-schema/db-schema.module';
+import { DeploysModule } from './deploys/deploys.module';
 import { HealthController } from './health/health.controller';
 import { HostReportsModule } from './host-reports/host-reports.module';
 import { ProjectsModule } from './projects/projects.module';
@@ -23,6 +25,8 @@ import { TasksModule } from './tasks/tasks.module';
     TasksModule,
     HostReportsModule,
     DbSchemaModule,
+    DeploysModule,
+    AgentsModule,
   ],
   controllers: [HealthController],
 })

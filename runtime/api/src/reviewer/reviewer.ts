@@ -3,6 +3,7 @@ import 'reflect-metadata';
 import { readFileSync } from 'node:fs';
 import { DataSource } from 'typeorm';
 import { buildDataSource } from '../data-source';
+import { callAgent } from '../agents/call-agent';
 
 /**
  * DevLoop Reviewer (Fas 4).
@@ -35,7 +36,6 @@ import { buildDataSource } from '../data-source';
 const POLL_INTERVAL_MS = 5_000;
 const BATCH_SIZE = 3;
 const MAX_DIFF_BYTES = 80 * 1024;
-const MODEL = 'gpt-5.4';
 
 // Review score gate: approved verdicts with a score below this
 // threshold are downgraded to changes_requested. Matches the
@@ -80,7 +80,6 @@ function loadSecret(name: string): string | null {
   }
 }
 
-const OPENAI_API_KEY = loadSecret('openai_api_key');
 const GITHUB_TOKEN = loadSecret('github_token');
 
 interface TaskForReview {
@@ -107,10 +106,12 @@ interface ReviewVerdict {
 
 async function main(): Promise<void> {
   console.log(`[rv] starting reviewer ${REVIEWER_ID}`);
-  if (OPENAI_API_KEY === null) {
-    console.error('[rv] FATAL: openai_api_key not loaded');
-    process.exit(2);
-  }
+  // The API key for the reviewer agent lives in the DB-backed
+  // agent_configs row and is loaded per-call by callAgent(). We
+  // no longer verify it at startup — a missing/misconfigured
+  // key surfaces as a loud error on the first real review call,
+  // which is fine because the reviewer keeps the task in 'review'
+  // and retries next iteration.
   if (GITHUB_TOKEN === null) {
     console.warn('[rv] no github_token — diff fetch will use anonymous GitHub which only works for public repos');
   }
@@ -261,10 +262,15 @@ async function reviewOneClaimed(
       ? diff.slice(0, MAX_DIFF_BYTES) + `\n\n…(truncated, original ${diff.length} bytes)`
       : diff;
 
-  // Step 2: ask gpt-5.4 for a verdict.
+  // Step 2: ask the reviewer agent (provider + model from
+  // agent_configs). The callAgent wrapper handles the webengine
+  // async job poll OR the openai sync call depending on config.
   let verdict: ReviewVerdict;
+  let modelUsed: string;
   try {
-    verdict = await askModel(task, diffTrimmed);
+    const out = await askModel(ds, task, diffTrimmed);
+    verdict = out.verdict;
+    modelUsed = out.model;
   } catch (err) {
     console.error(`[rv] ${task.display_id} model call failed:`, err);
     return;
@@ -310,7 +316,7 @@ async function reviewOneClaimed(
           task.task_id,
           task.lease_version,
           verdict.decision,
-          MODEL,
+          modelUsed,
           verdict.score,
           JSON.stringify({ summary: verdict.summary }),
         ],
@@ -331,7 +337,7 @@ async function reviewOneClaimed(
           $4::varchar(128)
         )
         `,
-        [task.task_id, task.lease_version, targetStatus, REVIEWER_ID, MODEL, verdict.score],
+        [task.task_id, task.lease_version, targetStatus, REVIEWER_ID, modelUsed, verdict.score],
       );
     });
   } catch (err) {
@@ -451,10 +457,14 @@ async function failReviewTask(
 }
 
 async function askModel(
+  ds: DataSource,
   task: TaskForReview,
   diff: string,
-): Promise<ReviewVerdict> {
-  const systemPrompt = `You are a code reviewer for the DevLoop AI bug-fix system. You see a bug report and a diff that an AI worker proposed as a fix. Your job is to decide whether the diff is acceptable to forward to a human merger.
+): Promise<{ verdict: ReviewVerdict; model: string }> {
+  // The "system prompt" for the reviewer role is stored in
+  // agent_configs.system_prompt and is prepended by callAgent.
+  // Here we only build the user-side content.
+  const prompt = `You are a code reviewer for the DevLoop AI bug-fix system. You see a bug report and a diff that an AI worker proposed as a fix. Your job is to decide whether the diff is acceptable to forward to a human merger.
 
 OUTPUT FORMAT — return EXACTLY a JSON object with these fields and no extra text:
 {
@@ -470,9 +480,9 @@ Guidelines:
 - score is your confidence that this diff is safe to merge: 0..40 = obviously bad, 41..70 = stub or partial, 71..100 = solid.
 - Keep summary under 200 chars.
 
-Risk tier and module are provided as context; do not let them dominate the decision — small low-risk diffs can still be wrong.`;
+Risk tier and module are provided as context; do not let them dominate the decision — small low-risk diffs can still be wrong.
 
-  const userPrompt = `Task: ${task.display_id}
+Task: ${task.display_id}
 Module: ${task.module}
 Risk tier: ${task.risk_tier}
 Branch: ${task.branch_name}
@@ -490,42 +500,20 @@ ${diff}
 
 Return your verdict as JSON now.`;
 
-  const payload = {
-    model: MODEL,
-    messages: [
-      { role: 'system', content: systemPrompt },
-      { role: 'user', content: userPrompt },
-    ],
-    reasoning_effort: 'medium',
-    max_completion_tokens: 4000,
-    response_format: { type: 'json_object' },
-  };
+  const result = await callAgent(ds, { role: 'reviewer', prompt });
 
-  const res = await fetch('https://api.openai.com/v1/chat/completions', {
-    method: 'POST',
-    headers: {
-      'Authorization': `Bearer ${OPENAI_API_KEY}`,
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify(payload),
-  });
-  if (!res.ok) {
-    const body = await res.text().catch(() => '');
-    throw new Error(`openai HTTP ${res.status}: ${body.slice(0, 200)}`);
-  }
-  const body = (await res.json()) as {
-    choices?: Array<{ message?: { content?: string } }>;
-  };
-  const content = body.choices?.[0]?.message?.content;
-  if (typeof content !== 'string' || content.length === 0) {
-    throw new Error('openai returned empty content');
-  }
+  // The webengine response often comes back with the JSON object
+  // embedded as-is; occasionally a model wraps it in ```json ... ```.
+  // Strip fenced code blocks before parsing.
+  const stripped = stripJsonFence(result.text);
 
   let parsed: { decision?: unknown; score?: unknown; summary?: unknown };
   try {
-    parsed = JSON.parse(content);
+    parsed = JSON.parse(stripped);
   } catch (err) {
-    throw new Error(`failed to parse model JSON: ${String(err)}`);
+    throw new Error(
+      `failed to parse model JSON: ${String(err)}; first 200 bytes: ${stripped.slice(0, 200)}`,
+    );
   }
   const decision = parsed.decision;
   const score = parsed.score;
@@ -545,10 +533,16 @@ Return your verdict as JSON now.`;
     throw new Error('bad summary');
   }
   return {
-    decision,
-    score,
-    summary: summary.slice(0, 500),
+    verdict: { decision, score, summary: summary.slice(0, 500) },
+    model: result.model,
   };
+}
+
+function stripJsonFence(s: string): string {
+  const trimmed = s.trim();
+  const fence = trimmed.match(/^```(?:json)?\s*\n?([\s\S]*?)\n?```$/);
+  if (fence && fence[1]) return fence[1].trim();
+  return trimmed;
 }
 
 function sleep(ms: number): Promise<void> {

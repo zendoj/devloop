@@ -1,6 +1,7 @@
 import { Inject, Injectable, Logger } from '@nestjs/common';
 import { DataSource } from 'typeorm';
 import { DATA_SOURCE } from '../db/db.module';
+import { callAgent } from '../agents/call-agent';
 
 /**
  * Shape of the classifier_rules JSONB column on project_configs.
@@ -74,8 +75,27 @@ export class ClassifierService {
     description: string,
   ): Promise<ClassificationResult> {
     const rules = await this.loadRules(projectId);
-    const text = `${title}\n${description}`.toLowerCase();
 
+    // Fas F2: try the AI classifier first. It gets a constrained
+    // list of valid module names + risk tiers derived from the
+    // project's rules (so the response is guaranteed to be a
+    // module the downstream pipeline already knows about). On
+    // ANY failure — disabled agent, network hiccup, unparseable
+    // JSON, out-of-allowlist module — we fall through to the
+    // regex rules below. This keeps the pipeline deterministic
+    // and bounded-latency even when the AI provider is flaky.
+    try {
+      const aiResult = await this.classifyWithAi(title, description, rules);
+      if (aiResult) {
+        return aiResult;
+      }
+    } catch (err) {
+      this.logger.warn(
+        `AI classifier failed, falling back to regex rules: ${(err as Error).message}`,
+      );
+    }
+
+    const text = `${title}\n${description}`.toLowerCase();
     for (const rule of rules.rules) {
       let re: RegExp;
       try {
@@ -100,6 +120,74 @@ export class ClassifierService {
       module: rules.default_module,
       risk_tier: rules.default_risk_tier,
       matched_rule: null,
+      config_id: null,
+    };
+  }
+
+  /**
+   * Classify via the `classifier` agent role. Returns null if the
+   * AI picks an out-of-allowlist module (so the caller falls back
+   * to regex rules). Throws on infra failure.
+   */
+  private async classifyWithAi(
+    title: string,
+    description: string,
+    rules: ClassifierRules,
+  ): Promise<ClassificationResult | null> {
+    const allowedModules = new Set<string>([
+      rules.default_module,
+      ...rules.rules.map((r) => r.module),
+    ]);
+    const moduleList = Array.from(allowedModules).sort().join(', ');
+    const validRiskTiers: RiskTier[] = ['low', 'standard', 'high', 'critical'];
+
+    const prompt = `Classify this bug report into a module and a risk tier.
+
+Allowed modules: ${moduleList}
+Allowed risk_tier: ${validRiskTiers.join(', ')}
+
+Return ONLY a JSON object with exactly these keys and no extra text:
+{"module":"<one of the allowed modules>","risk_tier":"<one of the allowed tiers>"}
+
+Report title: ${title}
+Report description:
+${description.slice(0, 4000)}`;
+
+    const result = await callAgent(this.ds, {
+      role: 'classifier',
+      prompt,
+    });
+
+    const stripped = stripJsonFence(result.text);
+    let parsed: { module?: unknown; risk_tier?: unknown };
+    try {
+      parsed = JSON.parse(stripped);
+    } catch {
+      this.logger.warn(
+        `classifier returned non-JSON: ${stripped.slice(0, 200)}`,
+      );
+      return null;
+    }
+
+    const mod = typeof parsed.module === 'string' ? parsed.module.trim() : '';
+    const tier = typeof parsed.risk_tier === 'string' ? parsed.risk_tier : '';
+
+    if (!allowedModules.has(mod)) {
+      this.logger.warn(`classifier picked disallowed module '${mod}'`);
+      return null;
+    }
+    if (!validRiskTiers.includes(tier as RiskTier)) {
+      this.logger.warn(`classifier picked invalid risk_tier '${tier}'`);
+      return null;
+    }
+
+    this.logger.log(
+      `AI classified as module=${mod} risk_tier=${tier} (${result.model}, ${result.elapsedMs}ms)`,
+    );
+    return {
+      module: mod,
+      risk_tier: tier as RiskTier,
+      matched_rule: `ai:${result.model}`,
       config_id: null,
     };
   }
@@ -198,4 +286,11 @@ export class ClassifierService {
       default_risk_tier: defaultRiskTier,
     };
   }
+}
+
+function stripJsonFence(s: string): string {
+  const trimmed = s.trim();
+  const fence = trimmed.match(/^```(?:json)?\s*\n?([\s\S]*?)\n?```$/);
+  if (fence && fence[1]) return fence[1].trim();
+  return trimmed;
 }
