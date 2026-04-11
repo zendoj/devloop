@@ -2,6 +2,7 @@ import { Module } from '@nestjs/common';
 import { AuthModule } from './auth/auth.module';
 import { ConfigModule } from './config/config.module';
 import { DbModule } from './db/db.module';
+import { DbSchemaModule } from './db-schema/db-schema.module';
 import { HealthController } from './health/health.controller';
 import { HostReportsModule } from './host-reports/host-reports.module';
 import { ProjectsModule } from './projects/projects.module';
@@ -21,6 +22,7 @@ import { TasksModule } from './tasks/tasks.module';
     ReportsModule,
     TasksModule,
     HostReportsModule,
+    DbSchemaModule,
   ],
   controllers: [HealthController],
 })
