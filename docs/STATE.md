@@ -1,8 +1,12 @@
 # DevLoop — Build State
 
-**Last updated:** 2026-04-11 (late-night session wrap)
-**Current branch:** `main`
-**Status:** Phase 1f complete. The central runtime is live at `https://devloop.airpipe.ai` with: auth (Argon2id + TOTP 2FA), project registration, bug-report intake with a stub orchestrator that auto-creates queued tasks, Overview stats, and sidebar navigation across 8 sections. The actual Claude-based fix execution loop (orchestrator → worker → reviewer → deployer → verification) is **not built yet** — see "What is still a stub" below.
+**Last updated:** 2026-04-11 (Fas 5 lit the full pipeline end-to-end)
+**Current branch:** `main` — local HEAD in sync with `origin/main`
+**Status:** **Phase 5 complete.** The DevLoop central runtime now drives a real end-to-end loop: a bug filed via `POST /api/reports` classifies → creates a queued task → acquires a module lock → a worker clones the project repo + commits a stub fix to a `devloop/task/T-N` branch + pushes to GitHub → a reviewer fetches the diff via the GitHub Compare API and runs gpt-5.4 reasoning=medium on it → the task is approved → the deployer Ed25519-signs a canonical JCS desired-state payload and calls `record_desired_state` → a host agent (dry-run) drives the apply lifecycle → the deployer's verifier transitions the task to `verified`.
+
+Every transition is audited via the hash-chained `audit_events` table. The whole loop takes ~20–30 seconds per bug on a cold cache. Verified with 7 end-to-end runs (T-3..T-9 all `verified`).
+
+**The Fas 3 worker is still a stub** — it appends a marker note to `DEVLOOP_TASKS.md` instead of running Claude in a sandbox. Everything ELSE on the path is real: real repos, real signing, real reviews, real audit. Swapping the stub for Claude is the only remaining piece before this is a real product.
 
 This file tracks *what is built right now*. For the full design see
 [ARCHITECTURE.md](ARCHITECTURE.md); for how to operate it see
@@ -53,6 +57,11 @@ Tech:
 | 1e | Stub orchestrator `orchestrate_task_for_report` (migration 012) + race fix `idx_agent_tasks_display_id_per_project` + advisory lock (migration 014) | ✓ | `4692ae9` | gpt-5.4 flagged race, fixed |
 | 1f | Tasks page with real queue + Overview stats endpoint (`/api/overview/stats`) | ✓ | `9b60a14` | — |
 | Fas 1 polish | addThread atomic FK→404, `new URL()` host_base_url parse, shared slug validator | ✓ | `efcb9a9` | gpt-5.4 round 2 → approved |
+| 2 | Real classifier + Worker Manager service | ✓ | `7c8d1e4` | (see Fas 2-5 bundle) |
+| 3 | Worker runtime: real git clone + branch + commit + push | ✓ | `d45726f` | (see Fas 2-5 bundle) |
+| 4 | Reviewer service with real gpt-5.4 reasoning=medium on the diff | ✓ | `e930d29` | (see Fas 2-5 bundle) |
+| 5 | Deployer (Ed25519 signed desired state) + Host Agent (dry-run apply) | ✓ | `ec46707` | (see Fas 2-5 bundle) |
+| 2-5 bundle | gpt-5.4 reasoning=medium, 7 rounds, changes_requested x6 → approved round 7 | ✓ | `fee80d6` → `ce743ff` | approved |
 
 Architecture doc: `docs/ARCHITECTURE.md` v10 (committed `45e9d7b` during
 bootstrap of the phased build, reviewed through 10 rounds with
@@ -65,13 +74,25 @@ gpt-5.4 reasoning=high).
 ### Services (systemd)
 
 ```
-devloop-api.service   → NestJS API at 127.0.0.1:3110
-devloop-web.service   → Next.js at 127.0.0.1:3120
-postgresql.service    → Postgres 16
+devloop-api.service             → NestJS API at 127.0.0.1:3110
+devloop-web.service             → Next.js at 127.0.0.1:3120
+devloop-worker-manager.service  → polls assigned tasks, runs git-worker
+devloop-reviewer.service        → polls review tasks, calls gpt-5.4
+devloop-deployer.service        → signs desired_state, runs verifier
+devloop-host-agent.service      → polls desired_state_history (dry-run)
+postgresql.service              → Postgres 16
 ```
 
-`devloop-web` has `Wants=devloop-api`. Both are enabled on boot.
-Start/stop/status commands are in [RUNBOOK.md](RUNBOOK.md#service-management).
+All six DevLoop services run as the `devloop-api` OS user,
+peer-mapped to the `devloop_api` Postgres role. They are all
+enabled on boot. The worker manager, deployer, and reviewer
+read file-backed secrets via systemd `LoadCredential`
+(`github_token`, `openai_api_key`,
+`deploy_signing_priv_devloop-2026-04`,
+`deploy_signing_active_key_id`).
+
+Start/stop/status commands are in
+[RUNBOOK.md](RUNBOOK.md#service-management).
 
 ### HTTP surface
 
@@ -135,6 +156,18 @@ WEB (Next.js Server Components unless noted)
 013_projects_insert_grant           GRANT INSERT on projects to devloop_api
 014_orchestrator_race_fix           UNIQUE (project_id, display_id) on agent_tasks +
                                     advisory lock in orchestrate_task_for_report
+015_orchestrator_classifier         orchestrate_task_for_report accepts module+risk_tier,
+                                    acquires module_lock, transitions queued → assigned
+                                    in the same txn when lock available
+016_record_worker_result            SECURITY DEFINER helper for stamping worker diff
+                                    metadata (branch_name, base/head_sha, files_changed)
+017_record_review_result            SECURITY DEFINER helper for stamping review verdict
+018_review_lease_fence              record_review_result now lease-fenced to prevent
+                                    double-reviewer corruption race
+019_worker_result_tighten           hex-only SHAs + branch charset + jsonb array check
+                                    in record_worker_result
+020_orchestrator_module_charset     DB-side module charset enforcement in
+                                    orchestrate_task_for_report
 ```
 
 Verify with: `sudo -u devloop-admin env DEVLOOP_DB_USER=devloop_owner \
@@ -221,89 +254,103 @@ sudo -u devloop-admin env \
 
 ---
 
-## What is still a stub (important to read before demoing)
+## What is REAL and what is STILL a stub
 
-The end-to-end **"file a bug and have DevLoop fix it"** loop is
-NOT complete. What exists:
+The end-to-end loop is now **live**. Everything ticked ✅ below
+runs as a systemd service and is exercised by the daily smoke.
 
-✅ **The intake + triage half:** A report is filed via
-`POST /api/reports`, the stub orchestrator `orchestrate_task_for_report`
-inserts a paired `agent_tasks` row in `queued_for_lock`, the report
-transitions `new → triaged`, audit events fire for both state
-changes. The task is visible in `/tasks`.
+### ✅ What is real
 
-❌ **The fix + deploy half:** Nothing advances a task out of
-`queued_for_lock`. Specifically missing:
+| Piece | Lives in | What it does |
+|---|---|---|
+| Classifier | `orchestrator/classifier.service.ts` | Reads `project_configs.classifier_rules` (or `DEFAULT_RULES`), maps bug report text to `module` + `risk_tier`. Strict charset + enum validation. |
+| Orchestrator | `migrations/020_orchestrator_module_charset.ts` | `orchestrate_task_for_report` row-locks the report, acquires module lock, allocates `T-N`, inserts task, triages report. Atomic. |
+| Worker Manager | `worker-manager/worker-manager.ts` | Polls `assigned` tasks, claims them, runs git-worker, stamps diff metadata, transitions `in_progress → review` in a single DB transaction. Also runs `retryQueued()` for tasks stuck in `queued_for_lock`. |
+| Git Worker | `worker-manager/git-worker.ts` | Real `git clone` via per-task `GIT_ASKPASS` (no token in argv), creates `devloop/task/T-N` branch, appends marker to `DEVLOOP_TASKS.md`, commits as "DevLoop Worker", pushes to GitHub. Worktree + askpass dir cleaned in `finally`. |
+| Reviewer | `reviewer/reviewer.ts` | Polls `review` tasks with a session-scoped `pg_try_advisory_lock` claim (no duplicate OpenAI calls), fetches diff via GitHub Compare API (403 rate-limit vs auth distinction), sends to `gpt-5.4 reasoning=medium` with strict JSON output, validates (integer score, enum decision), enforces score-gate (`approved` requires score ≥ 60), stamps result lease-fenced, transitions to `approved`/`changes_requested`. |
+| Deployer | `deployer/deployer.ts` + `deployer/jcs.ts` | Polls `approved` tasks. All 4 DB steps (`approved → deploying → merged → record_desired_state → verifying`) in a single `ds.transaction()`. Signs the canonical RFC 8785 JCS payload with Ed25519 (`crypto.sign(null, ...)`) from the active key on disk. Verifier loop transitions `verifying → verified` when `dsh.applied_sha = at.merged_commit_sha = dsh.deploy_sha`. |
+| Host Agent | `host-agent/host-agent.ts` | **DRY-RUN mode.** Polls `desired_state_history`, calls `record_apply_started → heartbeat → record_deploy_applied('success')` lifecycle. Never actually touches a host file system or restarts a service. |
+| Audit chain | `migrations/003_audit_infrastructure.ts` | Every transition appends a hash-chained row to `audit_events`. Append-only triggers block direct DML. |
 
-1. **Module classification.** The stub orchestrator hardcodes
-   `module='unknown'` and `risk_tier='standard'`. A real classifier
-   should read the project_config's classifier_rules, map the
-   report text to a module path, and assign a risk tier. See
-   ARCHITECTURE §6.
-2. **Worker manager.** Nothing polls `agent_tasks WHERE status IN
-   ('assigned', 'queued_for_lock')` and calls `claim_assigned_task`.
-3. **Worker runtime.** No process spawns Claude in a bwrap
-   sandbox, clones the repo, runs the fix, and commits a branch.
-   Needs Anthropic API key provisioning and the sandbox infra
-   that ARCHITECTURE §4.3 / §8 describes.
-4. **Reviewer.** No process calls OpenAI to review the diff and
-   invoke `fence_and_transition` with a review decision.
-5. **Deployer.** No process signs a desired state row via
-   `record_desired_state` and pushes the branch + PR to GitHub.
-6. **Host deploy agent.** No agent on any real host is polling
-   `desired_state_history` and calling `record_apply_*`.
-7. **Verification scanner.** Nothing calls
-   `record_host_health_probe` / `record_apply_timeout`.
+### ❌ What is still a stub
 
-All of this is **weeks of work**. The DB schema, stored
-procedures, and RBAC matrix for every piece above already exist
-and are verified — what's missing is the actual process code that
-calls into them. See ARCHITECTURE §3.1.2 for the full service
-inventory.
+1. **Worker's "fix"**: The git-worker appends a marker note to
+   `DEVLOOP_TASKS.md` instead of running Claude in a bwrap
+   sandbox to actually fix the bug. This is the **one** piece
+   that stands between the current pipeline and a working
+   auto-fix product. Everything around it is real.
+2. **Host Agent applying for real**: Currently `DRY_RUN=true`
+   hardcoded. A real host agent would:
+   - verify the Ed25519 signature against the public key from
+     `signing_keys`
+   - `git fetch` + `git checkout` `deploy_sha`
+   - run `post_deploy_command`
+   - poll `health_check_url` for 60 s of continuous `up`
+   - report success/failure
+3. **GitHub PR merge**: The deployer uses `approved_head_sha`
+   as the `merged_commit_sha`. No real PR merge on GitHub. The
+   `devloop/task/T-N` branch sits on the project repo for a
+   human to merge.
+4. **Per-service PG roles**: All 4 daemons run as `devloop_api`.
+   The architecture's `devloop_orch` / `devloop_rev` /
+   `devloop_dep` / `devloop_wm` split is deferred.
+5. **Rollback loop**: `rolling_back` / `rolled_back` states
+   exist in the state machine but no code drives them.
 
 ---
 
 ## What is next
 
-Ordered by what it unlocks:
+Ordered by what unlocks the most:
 
-1. **Run the full loop manually.** A DBA can manually walk a task
-   through the state machine via psql + the existing procedures to
-   demo the end state before any worker exists. Useful as a
-   integration-test anchor.
+1. **Wire Claude into the worker.** The single piece that turns
+   DevLoop into a real product. Replace `runWorkerStub()` in
+   `git-worker.ts` with:
+   - load `anthropic_api_key` via `SecretsService`
+   - spawn the worker in a bwrap sandbox (per ARCHITECTURE §4.3 / §8)
+     with read-only access to the worktree except for the branch
+     checkout, no network except the Anthropic API
+   - run the Claude loop with the report as context and a tool
+     allowlist (file read/write, bash restricted to a safe set)
+   - capture the resulting diff, commit, push
+   - keep the same `WorkerRunResult` return shape so the
+     Worker Manager, reviewer, and deployer paths do not
+     change.
 
-2. **Classifier.** Replace the stubbed `module='unknown'` with a
-   real classifier call (can be a simple regex map in Fas 2, then
-   GPT-based later).
+2. **Per-service PG roles.** Split `devloop_api` into
+   `devloop_orch`, `devloop_rev`, `devloop_dep`, `devloop_wm`
+   per ARCHITECTURE §19 D26. New OS users, `pg_ident.conf`
+   entries, migration with the right grants per service.
 
-3. **Worker manager skeleton + worker runtime.** The biggest piece.
-   Needs the sandbox infra + Anthropic API key wiring.
+3. **Host agent gets real apply.** Flip `DRY_RUN=false`, add
+   signature verification against `signing_keys.public_key`,
+   real `git fetch` + `git checkout` + `post_deploy_command`
+   + health probe.
 
-4. **Reviewer worker.** Simpler — it calls OpenAI on the diff.
-   Needs `/etc/devloop/openai_api_key` provisioned.
+4. **Host agent runs on actual hosts.** The current host-agent
+   is colocated on the central machine. A real deployment moves
+   it to each managed host, where it only has SELECT on
+   `desired_state_history` and EXECUTE on `record_apply_*` for
+   its own project.
 
-5. **Deployer.** Writes desired state + opens PR. Needs GitHub App
-   credentials at `/etc/devloop/github_app_key` and the deploy
-   signing private key.
+5. **GitHub PR merge.** Deployer currently treats
+   `approved_head_sha` as the `merged_commit_sha`. A real
+   deployer opens a PR via the GitHub API and merges it (or
+   relies on branch protection + a human merge). Requires
+   `github_app_key` provisioning.
 
-6. **Host deploy agent.** Runs on each managed host, polls central,
-   applies, reports status.
+6. **Rollback loop.** The state machine has `rolling_back` /
+   `rolled_back` / `rollback_failed` but no code drives them.
+   Needs: failed verification trigger, deployer takes a new
+   action: 'rollback' desired state row pointing at the prior
+   merged sha.
 
-7. **Remaining DB roles.** `devloop_orch`, `devloop_rev`,
-   `devloop_dep`, `devloop_wm` get their own PG roles + OS users +
-   pg_ident mappings, matching ARCHITECTURE §19 D26. Done when
-   each of those workers ships.
+7. **Real Anthropic key + OpenAI key hygiene.** Rotate the
+   exposed OpenAI key (still in
+   `/opt/dev_energicrm/backend/.env`, exposed 2026-04-10). Add
+   `/etc/devloop/anthropic_api_key` when worker runtime goes
+   real.
 
-8. **Push to origin.** The local branch is many commits ahead of
-   `origin/main`. The environment this work runs in has no GitHub
-   credentials — someone with push access needs to run
-   `cd /opt/devloop && git push origin main`.
-
-9. **Let's Encrypt cert for devloop.airpipe.ai.** Self-signed
-   today, works because Cloudflare terminates TLS. Swap to LE once
-   we move away from CF "Full" mode. See RUNBOOK.md §Certificates.
-
-10. **OpenAI key rotation.** The key in
-    `/opt/dev_energicrm/backend/.env` was exposed in chat on
-    2026-04-10 ~21:15 UTC and must be rotated within 24 hours.
-    Entry: `~/.claude/projects/-opt-dev-energicrm/memory/rotate_openai_key_pending.md`.
+8. **Let's Encrypt cert for devloop.airpipe.ai.** Self-signed
+   today, works because Cloudflare terminates TLS. Swap to LE
+   once we move away from CF "Full" mode.
