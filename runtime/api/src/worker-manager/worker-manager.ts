@@ -287,54 +287,59 @@ async function processOne(
     }
   }
 
-  // Step 4: stamp the diff metadata via the SECURITY DEFINER
-  // helper. Returns false if the task moved out of in_progress
-  // (e.g. cancelled by janitor) — in that case bail out.
-  const stamped = (await ds.query(
-    `
-    SELECT public.record_worker_result(
-      $1, $2, $3, $4, $5::jsonb
-    ) AS ok
-    `,
-    [
-      taskId,
-      result.branch_name,
-      result.base_sha,
-      result.head_sha,
-      JSON.stringify(result.files_changed),
-    ],
-  )) as Array<{ ok: boolean }>;
-  if (stamped[0]?.ok !== true) {
-    console.warn(`[wm] ${ctx.display_id} record_worker_result returned false`);
-    return;
-  }
+  // Steps 4 + 5 atomic: stamp the diff metadata AND transition
+  // in_progress → review in one DB transaction so a process
+  // crash between them cannot leave the task wedged in
+  // in_progress with branch/SHA already set. PG holds the
+  // row lock until commit; on crash both roll back together.
+  const finalLease = await ds.transaction(async (m) => {
+    const stamped = (await m.query(
+      `
+      SELECT public.record_worker_result(
+        $1, $2, $3, $4, $5::jsonb
+      ) AS ok
+      `,
+      [
+        taskId,
+        result.branch_name,
+        result.base_sha,
+        result.head_sha,
+        JSON.stringify(result.files_changed),
+      ],
+    )) as Array<{ ok: boolean }>;
+    if (stamped[0]?.ok !== true) {
+      // Janitor cancelled in parallel — abort the txn so the
+      // stamped fields roll back too.
+      throw new Error('record_worker_result returned false');
+    }
 
-  // Step 5: transition in_progress → review.
-  const reviewRows = (await ds.query(
-    `
-    SELECT public.fence_and_transition(
-      $1, $2::bigint, 'in_progress'::public.task_status_enum,
-      'review'::public.task_status_enum,
-      $3::varchar(128), 'system'::public.actor_kind_enum,
-      jsonb_build_object(
-        'worker_id', $3::text,
-        'branch',    $4::text,
-        'head_sha',  $5::text,
-        'summary',   $6::text
-      ),
-      $3::varchar(128)
-    ) AS new_lease
-    `,
-    [
-      taskId,
-      currentLease,
-      WORKER_ID,
-      result.branch_name,
-      result.head_sha,
-      result.summary,
-    ],
-  )) as Array<{ new_lease: string | number }>;
-  currentLease = Number(reviewRows[0]?.new_lease ?? currentLease);
+    const reviewRows = (await m.query(
+      `
+      SELECT public.fence_and_transition(
+        $1, $2::bigint, 'in_progress'::public.task_status_enum,
+        'review'::public.task_status_enum,
+        $3::varchar(128), 'system'::public.actor_kind_enum,
+        jsonb_build_object(
+          'worker_id', $3::text,
+          'branch',    $4::text,
+          'head_sha',  $5::text,
+          'summary',   $6::text
+        ),
+        $3::varchar(128)
+      ) AS new_lease
+      `,
+      [
+        taskId,
+        currentLease,
+        WORKER_ID,
+        result.branch_name,
+        result.head_sha,
+        result.summary,
+      ],
+    )) as Array<{ new_lease: string | number }>;
+    return Number(reviewRows[0]?.new_lease ?? currentLease);
+  });
+  currentLease = finalLease;
   console.log(`[wm] ${ctx.display_id} → review lease=${currentLease}`);
 }
 

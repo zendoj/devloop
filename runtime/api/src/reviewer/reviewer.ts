@@ -193,48 +193,60 @@ async function reviewOne(ds: DataSource, task: TaskForReview): Promise<void> {
     `[rv] ${task.display_id} verdict ${verdict.decision} score=${verdict.score}`,
   );
 
-  // Step 3: lease-fenced stamp via record_review_result. The
-  // updated signature (migration 018) requires expected_lease.
-  // If two reviewer instances both pick up the same task, the
-  // first one to call this wins and the second sees zero rows
-  // and aborts cleanly without fence_and_transition'ing.
-  const stamped = (await ds.query(
-    `
-    SELECT public.record_review_result(
-      $1, $2::bigint, $3::public.review_decision_enum, $4, $5, $6::jsonb
-    ) AS ok
-    `,
-    [
-      task.task_id,
-      task.lease_version,
-      verdict.decision,
-      MODEL,
-      verdict.score,
-      JSON.stringify({ summary: verdict.summary }),
-    ],
-  )) as Array<{ ok: boolean }>;
-  if (stamped[0]?.ok !== true) {
-    console.warn(
-      `[rv] ${task.display_id} record_review_result returned false (lost race / already decided) — skipping`,
-    );
-    return;
-  }
-
-  // Step 4: fence_and_transition to approved or changes_requested.
+  // Steps 3 + 4 atomic: lease-fenced stamp + status transition
+  // in one DB transaction. Without this, a process crash after
+  // record_review_result but before fence_and_transition would
+  // leave the task in 'review' with review_decision set, which
+  // the poll query explicitly excludes — wedging the task
+  // forever. Wrapping in ds.transaction() means PG rolls back
+  // both on a crash and the next reviewer pass retries cleanly.
   const targetStatus =
     verdict.decision === 'approved' ? 'approved' : 'changes_requested';
-  await ds.query(
-    `
-    SELECT public.fence_and_transition(
-      $1, $2::bigint, 'review'::public.task_status_enum,
-      $3::public.task_status_enum,
-      $4::varchar(128), 'system'::public.actor_kind_enum,
-      jsonb_build_object('reviewer_id', $4::text, 'model', $5::text, 'score', $6::int),
-      $4::varchar(128)
-    )
-    `,
-    [task.task_id, task.lease_version, targetStatus, REVIEWER_ID, MODEL, verdict.score],
-  );
+  try {
+    await ds.transaction(async (m) => {
+      const stamped = (await m.query(
+        `
+        SELECT public.record_review_result(
+          $1, $2::bigint, $3::public.review_decision_enum, $4, $5, $6::jsonb
+        ) AS ok
+        `,
+        [
+          task.task_id,
+          task.lease_version,
+          verdict.decision,
+          MODEL,
+          verdict.score,
+          JSON.stringify({ summary: verdict.summary }),
+        ],
+      )) as Array<{ ok: boolean }>;
+      if (stamped[0]?.ok !== true) {
+        // Lost the race or already decided — abort the txn so
+        // the stamp does not land partially.
+        throw new Error('record_review_result returned false');
+      }
+
+      await m.query(
+        `
+        SELECT public.fence_and_transition(
+          $1, $2::bigint, 'review'::public.task_status_enum,
+          $3::public.task_status_enum,
+          $4::varchar(128), 'system'::public.actor_kind_enum,
+          jsonb_build_object('reviewer_id', $4::text, 'model', $5::text, 'score', $6::int),
+          $4::varchar(128)
+        )
+        `,
+        [task.task_id, task.lease_version, targetStatus, REVIEWER_ID, MODEL, verdict.score],
+      );
+    });
+  } catch (err) {
+    if ((err as Error).message === 'record_review_result returned false') {
+      console.warn(
+        `[rv] ${task.display_id} review stamp lost race / already decided — skipping`,
+      );
+      return;
+    }
+    throw err;
+  }
   console.log(`[rv] ${task.display_id} → ${targetStatus}`);
 }
 
