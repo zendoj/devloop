@@ -306,7 +306,7 @@ export default async function TaskDetailPage({
       {task.attachments && task.attachments.length > 0 && (
         <section style={{ marginBottom: 24 }}>
           <h2 style={{ fontSize: 14, fontWeight: 600, marginBottom: 6 }}>
-            Bug-report attachments
+            Bug-report attachments ({task.attachments.length})
           </h2>
           <div
             className="card"
@@ -314,58 +314,10 @@ export default async function TaskDetailPage({
               padding: 14,
               display: 'flex',
               flexDirection: 'column',
-              gap: 10,
+              gap: 14,
             }}
           >
-            {task.attachments.map((a) => {
-              const isImage = a.mime_type.startsWith('image/');
-              const isText =
-                a.mime_type.startsWith('text/') ||
-                a.mime_type === 'application/json';
-              return (
-                <div key={a.id} style={{ fontSize: 12 }}>
-                  <div style={{ color: '#8a8f99', marginBottom: 4 }}>
-                    <code>{a.name}</code>{' '}
-                    <span style={{ color: '#6b7280' }}>
-                      {a.mime_type} · {a.size}B
-                    </span>
-                  </div>
-                  {isImage ? (
-                    // eslint-disable-next-line @next/next/no-img-element
-                    <img
-                      src={`data:${a.mime_type};base64,${a.content_base64}`}
-                      alt={a.name}
-                      style={{
-                        maxWidth: '100%',
-                        maxHeight: 320,
-                        borderRadius: 4,
-                        border: '1px solid #2a2f3a',
-                      }}
-                    />
-                  ) : isText ? (
-                    <pre
-                      style={{
-                        fontSize: 11,
-                        color: '#c5c8d0',
-                        background: '#0f1117',
-                        padding: 8,
-                        borderRadius: 4,
-                        maxHeight: 240,
-                        overflow: 'auto',
-                        whiteSpace: 'pre-wrap',
-                        margin: 0,
-                      }}
-                    >
-                      {Buffer.from(a.content_base64, 'base64').toString('utf-8').slice(0, 8000)}
-                    </pre>
-                  ) : (
-                    <div style={{ color: '#6b7280' }}>
-                      (binary — {a.size} bytes)
-                    </div>
-                  )}
-                </div>
-              );
-            })}
+            {task.attachments.map((a) => renderAttachment(a))}
           </div>
         </section>
       )}
@@ -405,6 +357,89 @@ export default async function TaskDetailPage({
           </div>
         </section>
       )}
+    </div>
+  );
+}
+
+/**
+ * Safely decode a base64 string to UTF-8 text without using
+ * Node's Buffer. atob + TextDecoder works in both server and
+ * client environments. Wraps in try/catch so one bad attachment
+ * doesn't crash the whole page.
+ */
+function decodeBase64Utf8(b64: string): string {
+  try {
+    const bin = atob(b64);
+    const bytes = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+    return new TextDecoder('utf-8', { fatal: false }).decode(bytes);
+  } catch {
+    return '[decode error — binary data]';
+  }
+}
+
+function renderAttachment(a: {
+  id: number;
+  name: string;
+  mime_type: string;
+  size: number;
+  content_base64: string;
+}): React.ReactElement {
+  const isImage = a.mime_type.startsWith('image/');
+  const isText =
+    a.mime_type.startsWith('text/') || a.mime_type === 'application/json';
+
+  let body: React.ReactNode;
+  if (isImage) {
+    // eslint-disable-next-line @next/next/no-img-element
+    body = (
+      <img
+        src={`data:${a.mime_type};base64,${a.content_base64}`}
+        alt={a.name}
+        style={{
+          maxWidth: '100%',
+          maxHeight: 320,
+          borderRadius: 4,
+          border: '1px solid #2a2f3a',
+        }}
+      />
+    );
+  } else if (isText) {
+    const text = decodeBase64Utf8(a.content_base64).slice(0, 8000);
+    body = (
+      <pre
+        style={{
+          fontSize: 11,
+          color: '#c5c8d0',
+          background: '#0f1117',
+          padding: 8,
+          borderRadius: 4,
+          maxHeight: 240,
+          overflow: 'auto',
+          whiteSpace: 'pre-wrap',
+          margin: 0,
+        }}
+      >
+        {text || '(empty)'}
+      </pre>
+    );
+  } else {
+    body = (
+      <div style={{ color: '#6b7280', fontSize: 12 }}>
+        (binary — {a.size} bytes)
+      </div>
+    );
+  }
+
+  return (
+    <div key={a.id} style={{ fontSize: 12 }}>
+      <div style={{ color: '#c5c8d0', marginBottom: 4 }}>
+        <code>{a.name}</code>{' '}
+        <span style={{ color: '#8a8f99' }}>
+          {a.mime_type} · {a.size}B
+        </span>
+      </div>
+      {body}
     </div>
   );
 }
