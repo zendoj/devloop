@@ -3,6 +3,7 @@ import { randomBytes, createHmac } from 'node:crypto';
 import { DataSource } from 'typeorm';
 import { SecretsService } from '../config/secrets.service';
 import { DATA_SOURCE } from '../db/db.module';
+import { isValidSlug } from './slug.util';
 
 /**
  * The shape returned by GET /projects. Deliberately NOT a 1:1 mirror
@@ -250,12 +251,14 @@ export class ProjectsService {
     const githubOwner = input.github_owner.trim();
     const githubRepo = input.github_repo.trim();
     const defaultBranch = (input.github_default_branch || 'main').trim();
-
-    if (!/^[a-z0-9][a-z0-9-]*$/.test(slug)) {
-      throw new BadRequestException('slug must match ^[a-z0-9][a-z0-9-]*$');
+    if (defaultBranch.length === 0 || defaultBranch.length > 128) {
+      throw new BadRequestException('github_default_branch must be 1..128 chars');
     }
-    if (slug.length < 2 || slug.length > 64) {
-      throw new BadRequestException('slug must be 2..64 chars');
+
+    if (!isValidSlug(slug)) {
+      throw new BadRequestException(
+        'slug must match ^[a-z0-9][a-z0-9-]*$ and be 2..64 chars',
+      );
     }
     if (name.length === 0 || name.length > 255) {
       throw new BadRequestException('name must be 1..255 chars');

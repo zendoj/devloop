@@ -1,4 +1,5 @@
 import {
+  BadRequestException,
   Body,
   Controller,
   Get,
@@ -22,6 +23,7 @@ import {
   ProjectListItem,
   ProjectsService,
 } from './projects.service';
+import { isValidSlug } from './slug.util';
 
 interface RequestWithSession extends FastifyRequest {
   session?: SessionContext;
@@ -80,8 +82,11 @@ export class ProjectsController {
   ): Promise<ProjectDetail> {
     const session = req.session;
     if (!session) throw new UnauthorizedException('unauthorized');
-    if (!/^[a-z0-9][a-z0-9-]*$/.test(slug)) {
-      throw new UnauthorizedException('unauthorized');
+    // Enforce the FULL slug contract (regex + length bounds) before
+    // the DB hit. Malformed route params should be 400, not 401 —
+    // the session is already valid at this point.
+    if (!isValidSlug(slug)) {
+      throw new BadRequestException('invalid slug');
     }
     return this.projects.getBySlug(slug, session.role);
   }

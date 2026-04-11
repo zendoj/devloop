@@ -104,8 +104,9 @@ export class ReportsController {
     if (session.role !== 'admin' && session.role !== 'super_admin') {
       throw new UnauthorizedException('unauthorized');
     }
-    // Look up the email for the thread author name so the UI shows
-    // something human instead of a uuid.
+    // The thread author label is derived from the session's user_id
+    // prefix; once the UI has a user profile fetch we can resolve
+    // this to the real email or display name.
     return this.reports.addThread({
       reportId: id,
       authorKind: 'user',
