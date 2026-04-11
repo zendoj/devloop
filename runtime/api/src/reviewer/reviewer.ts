@@ -386,12 +386,37 @@ async function fetchDiff(
   );
   // 5xx → upstream is sick, retry.
   // 429 → rate-limited, retry.
-  // 401/403 → bad/expired token, permanent (operator must rotate).
+  // 403 → MIGHT be rate-limit / abuse detection (retry) or
+  //        bad/expired token (permanent). GitHub uses 403
+  //        liberally — inspect headers and body to decide.
+  // 401 → bad/expired token, permanent.
   // 404 → repo or compare missing, permanent.
   // 422 → SHAs do not exist or unrelated, permanent.
   // Other 4xx → permanent.
   if (res.status >= 500 || res.status === 429) {
     return { kind: 'transient', reason: `HTTP ${res.status}` };
+  }
+  if (res.status === 403) {
+    // Treat as transient if GitHub is signaling a rate limit or
+    // abuse-detection throttle via headers or body wording.
+    const remaining = res.headers.get('x-ratelimit-remaining');
+    const retryAfter = res.headers.get('retry-after');
+    const bodyLower = body.toLowerCase();
+    const looksRateLimited =
+      remaining === '0' ||
+      retryAfter !== null ||
+      bodyLower.includes('rate limit exceeded') ||
+      bodyLower.includes('secondary rate limit') ||
+      bodyLower.includes('abuse detection') ||
+      bodyLower.includes('api rate limit');
+    if (looksRateLimited) {
+      return {
+        kind: 'transient',
+        reason: `HTTP 403 rate limit (remaining=${remaining ?? 'n/a'}, retry-after=${retryAfter ?? 'n/a'})`,
+      };
+    }
+    // Real auth/permission failure — permanent.
+    return { kind: 'permanent', reason: `HTTP 403: ${snippet}` };
   }
   return { kind: 'permanent', reason: `HTTP ${res.status}: ${snippet}` };
 }
