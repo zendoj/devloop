@@ -3,6 +3,7 @@ import { AuthModule } from './auth/auth.module';
 import { ConfigModule } from './config/config.module';
 import { DbModule } from './db/db.module';
 import { HealthController } from './health/health.controller';
+import { HostReportsModule } from './host-reports/host-reports.module';
 import { ProjectsModule } from './projects/projects.module';
 import { ReportsModule } from './reports/reports.module';
 import { TasksModule } from './tasks/tasks.module';
@@ -19,6 +20,7 @@ import { TasksModule } from './tasks/tasks.module';
     ProjectsModule,
     ReportsModule,
     TasksModule,
+    HostReportsModule,
   ],
   controllers: [HealthController],
 })
