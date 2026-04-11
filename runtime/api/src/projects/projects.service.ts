@@ -263,11 +263,23 @@ export class ProjectsService {
     if (name.length === 0 || name.length > 255) {
       throw new BadRequestException('name must be 1..255 chars');
     }
-    if (!/^https:\/\//.test(hostBaseUrl)) {
-      throw new BadRequestException('host_base_url must start with https://');
-    }
     if (hostBaseUrl.length > 512) {
       throw new BadRequestException('host_base_url max 512 chars');
+    }
+    // Stricter URL parse: protocol MUST be https, hostname MUST be
+    // non-empty. Catches degenerate values like 'https://' or
+    // 'https://   ' that a plain regex would pass through.
+    let parsed: URL;
+    try {
+      parsed = new URL(hostBaseUrl);
+    } catch {
+      throw new BadRequestException('host_base_url is not a valid URL');
+    }
+    if (parsed.protocol !== 'https:') {
+      throw new BadRequestException('host_base_url must use https://');
+    }
+    if (parsed.hostname.length === 0) {
+      throw new BadRequestException('host_base_url must have a hostname');
     }
     if (input.github_app_install_id <= 0) {
       throw new BadRequestException('github_app_install_id must be > 0');

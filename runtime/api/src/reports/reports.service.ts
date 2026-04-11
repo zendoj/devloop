@@ -267,27 +267,31 @@ export class ReportsService {
       throw new Error(`invalid author_kind: ${input.authorKind}`);
     }
 
-    // Verify report exists.
-    const exists = (await this.ds.query(
-      `SELECT 1 FROM public.reports WHERE id = $1 LIMIT 1`,
-      [input.reportId],
-    )) as Array<{ '?column?': number }>;
-    if (exists.length === 0) {
-      throw new NotFoundException('report not found');
+    // Insert directly and translate the FK violation into a 404 so
+    // a race (report deleted between existence check and insert)
+    // surfaces as the right status code and the whole flow is
+    // atomic with a single round trip.
+    try {
+      const rows = (await this.ds.query(
+        `
+        INSERT INTO public.report_threads (report_id, author_kind, author_name, body)
+        VALUES ($1, $2::public.thread_author_enum, $3, $4)
+        RETURNING id
+        `,
+        [input.reportId, input.authorKind, authorName, body],
+      )) as Array<{ id: string }>;
+      const id = rows[0]?.id;
+      if (!id) {
+        throw new Error('thread insert did not return id');
+      }
+      return { id };
+    } catch (err) {
+      const msg = (err as Error).message;
+      const code = (err as { code?: string }).code;
+      if (code === '23503' || msg.includes('report_threads_report_id_fkey')) {
+        throw new NotFoundException('report not found');
+      }
+      throw err;
     }
-
-    const rows = (await this.ds.query(
-      `
-      INSERT INTO public.report_threads (report_id, author_kind, author_name, body)
-      VALUES ($1, $2::public.thread_author_enum, $3, $4)
-      RETURNING id
-      `,
-      [input.reportId, input.authorKind, authorName, body],
-    )) as Array<{ id: string }>;
-    const id = rows[0]?.id;
-    if (!id) {
-      throw new Error('thread insert did not return id');
-    }
-    return { id };
   }
 }
