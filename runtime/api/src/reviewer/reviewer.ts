@@ -193,15 +193,20 @@ async function reviewOne(ds: DataSource, task: TaskForReview): Promise<void> {
     `[rv] ${task.display_id} verdict ${verdict.decision} score=${verdict.score}`,
   );
 
-  // Step 3: stamp via record_review_result.
+  // Step 3: lease-fenced stamp via record_review_result. The
+  // updated signature (migration 018) requires expected_lease.
+  // If two reviewer instances both pick up the same task, the
+  // first one to call this wins and the second sees zero rows
+  // and aborts cleanly without fence_and_transition'ing.
   const stamped = (await ds.query(
     `
     SELECT public.record_review_result(
-      $1, $2::public.review_decision_enum, $3, $4, $5::jsonb
+      $1, $2::bigint, $3::public.review_decision_enum, $4, $5, $6::jsonb
     ) AS ok
     `,
     [
       task.task_id,
+      task.lease_version,
       verdict.decision,
       MODEL,
       verdict.score,
@@ -209,7 +214,9 @@ async function reviewOne(ds: DataSource, task: TaskForReview): Promise<void> {
     ],
   )) as Array<{ ok: boolean }>;
   if (stamped[0]?.ok !== true) {
-    console.warn(`[rv] ${task.display_id} record_review_result returned false`);
+    console.warn(
+      `[rv] ${task.display_id} record_review_result returned false (lost race / already decided) — skipping`,
+    );
     return;
   }
 

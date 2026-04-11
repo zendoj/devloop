@@ -95,6 +95,7 @@ async function main(): Promise<void> {
   try {
     while (running) {
       try {
+        await retryQueued(ds);
         await runOnce(ds);
       } catch (err) {
         console.error('[wm] iteration error:', err);
@@ -104,6 +105,64 @@ async function main(): Promise<void> {
   } finally {
     await ds.destroy();
     console.log('[wm] shutdown complete');
+  }
+}
+
+/**
+ * Sweep tasks the orchestrator left in queued_for_lock because
+ * the module lock was held by another active task. Try to
+ * acquire the lock now; on success, fence_and_transition the
+ * task into 'assigned' so the next runOnce pass picks it up.
+ *
+ * Without this loop a task can stall forever the moment two
+ * reports land in the same module simultaneously. With it, the
+ * second task gets promoted as soon as the first releases its
+ * module lock (any terminal/lock-releasing transition).
+ */
+async function retryQueued(ds: DataSource): Promise<void> {
+  const rows = (await ds.query(
+    `
+    SELECT id, project_id, module, lease_version
+      FROM public.agent_tasks
+     WHERE status = 'queued_for_lock'
+     ORDER BY created_at ASC
+     LIMIT $1
+    `,
+    [BATCH_SIZE],
+  )) as Array<{
+    id: string;
+    project_id: string;
+    module: string;
+    lease_version: string | number;
+  }>;
+
+  for (const task of rows) {
+    if (!running) break;
+    try {
+      const lease = (await ds.query(
+        `SELECT public.acquire_module_lock($1, $2, $3, $4) AS lease`,
+        [task.project_id, task.module, task.id, WORKER_ID],
+      )) as Array<{ lease: string | number | null }>;
+      if (lease[0]?.lease === null || lease[0]?.lease === undefined) {
+        // Still held by someone else — skip this iteration.
+        continue;
+      }
+      await ds.query(
+        `
+        SELECT public.fence_and_transition(
+          $1, $2::bigint, 'queued_for_lock'::public.task_status_enum,
+          'assigned'::public.task_status_enum,
+          $3::varchar(128), 'system'::public.actor_kind_enum,
+          jsonb_build_object('module_lease', $4::int),
+          NULL::varchar(128)
+        )
+        `,
+        [task.id, Number(task.lease_version), WORKER_ID, Number(lease[0].lease)],
+      );
+      console.log(`[wm] ${task.id} promoted queued_for_lock → assigned`);
+    } catch (err) {
+      console.error(`[wm] retry promote ${task.id} failed:`, err);
+    }
   }
 }
 

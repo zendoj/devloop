@@ -1,6 +1,6 @@
 /* eslint-disable no-console */
 import { spawn } from 'node:child_process';
-import { mkdir, rm, writeFile, readFile } from 'node:fs/promises';
+import { mkdir, rm, writeFile, readFile, chmod } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
 
 /**
@@ -75,27 +75,61 @@ export async function runWorkerStub(
   await mkdir(workDir, { recursive: true });
 
   const branchName = `devloop/task/${input.displayId.toLowerCase()}`;
-  const cloneUrl = `https://x-access-token:${safeToken}@github.com/${input.githubOwner}/${input.githubRepo}.git`;
-  const displayCloneUrl = `https://github.com/${input.githubOwner}/${input.githubRepo}.git`;
-  console.log(`[worker] cloning ${displayCloneUrl} → ${workDir}`);
+  // Bare URL with no token. The token is fed via GIT_ASKPASS so
+  // it never lands in argv (and thus never in /proc/<pid>/cmdline
+  // or process listings). The askpass script reads the token
+  // from a per-task file mode 0600 owned by the running user
+  // and is deleted in the finally block.
+  const repoUrl = `https://github.com/${input.githubOwner}/${input.githubRepo}.git`;
+  console.log(`[worker] cloning ${repoUrl} → ${workDir}`);
+
+  // Per-task askpass setup. The script writes the token to
+  // stdout when git asks for "Password for ...". The username
+  // git asks for first ('x-access-token') is hardcoded into the
+  // URL via the credential helper config below.
+  const askpassDir = `${WORKTREES_BASE}/.askpass-${input.taskId}`;
+  await mkdir(askpassDir, { recursive: true });
+  await chmod(askpassDir, 0o700);
+  const tokenPath = `${askpassDir}/token`;
+  const askpassPath = `${askpassDir}/askpass.sh`;
+  await writeFile(tokenPath, safeToken, 'utf8');
+  await chmod(tokenPath, 0o600);
+  // The askpass script echoes either the username or the token
+  // depending on the prompt git issues. We use a fixed username
+  // 'x-access-token' which is GitHub's documented bot user
+  // for installation tokens.
+  const askpassScript = `#!/bin/sh
+case "$1" in
+  Username*) echo "x-access-token" ;;
+  Password*) cat "${tokenPath}" ;;
+esac
+`;
+  await writeFile(askpassPath, askpassScript, 'utf8');
+  await chmod(askpassPath, 0o700);
+
+  const askpassEnv = {
+    GIT_ASKPASS: askpassPath,
+    DEVLOOP_TOKEN_PATH: tokenPath,
+  };
 
   try {
     await runGit(
-      ['clone', '--depth', '1', '--branch', input.defaultBranch, cloneUrl, workDir],
+      ['clone', '--depth', '1', '--branch', input.defaultBranch, repoUrl, workDir],
       '/',
       safeToken,
+      askpassEnv,
     );
 
     // Capture base SHA so reviewer/deployer can reason about drift.
-    const baseSha = (await runGit(['rev-parse', 'HEAD'], workDir, safeToken)).trim();
+    const baseSha = (await runGit(['rev-parse', 'HEAD'], workDir, safeToken, askpassEnv)).trim();
 
     // Identity for the commit. Deliberately scoped to this worktree
     // via local `git config`, never global.
-    await runGit(['config', 'user.email', 'devloop@airpipe.ai'], workDir, safeToken);
-    await runGit(['config', 'user.name', 'DevLoop Worker'], workDir, safeToken);
+    await runGit(['config', 'user.email', 'devloop@airpipe.ai'], workDir, safeToken, askpassEnv);
+    await runGit(['config', 'user.name', 'DevLoop Worker'], workDir, safeToken, askpassEnv);
 
     // Branch off the default branch.
-    await runGit(['checkout', '-b', branchName], workDir, safeToken);
+    await runGit(['checkout', '-b', branchName], workDir, safeToken, askpassEnv);
 
     // Trivial "fix": append a marker note to DEVLOOP_TASKS.md. This
     // is the Fas 3 stub — real Claude invocation ships in Fas 3b.
@@ -134,15 +168,14 @@ _This placeholder note was added by DevLoop Worker stub. Fas 3b wires in Claude 
       ],
       workDir,
       safeToken,
+      askpassEnv,
     );
 
-    const headSha = (await runGit(['rev-parse', 'HEAD'], workDir, safeToken)).trim();
+    const headSha = (await runGit(['rev-parse', 'HEAD'], workDir, safeToken, askpassEnv)).trim();
 
-    // Push the branch. --force-with-lease is safer than --force if
-    // someone else is simultaneously pushing to the same branch,
-    // but since this branch is newly minted it does not matter
-    // much here. Plain push works.
-    await runGit(['push', 'origin', branchName], workDir, safeToken);
+    // Push the branch. The askpass helper provides credentials
+    // when git prompts; the token never appears in argv.
+    await runGit(['push', 'origin', branchName], workDir, safeToken, askpassEnv);
 
     return {
       branch_name: branchName,
@@ -152,10 +185,18 @@ _This placeholder note was added by DevLoop Worker stub. Fas 3b wires in Claude 
       summary: commitSubject,
     };
   } finally {
-    // Always clean up the worktree so the next task run starts
-    // fresh and no credentialed remote lingers on disk.
+    // Always clean up the worktree AND the askpass helper dir so
+    // the next task run starts fresh and the token file is not
+    // left on disk. Both paths are validated against the
+    // hardcoded prefix before rm.
     if (workDir.startsWith(`${WORKTREES_BASE}/`) && existsSync(workDir)) {
       await rm(workDir, { recursive: true, force: true });
+    }
+    if (
+      askpassDir.startsWith(`${WORKTREES_BASE}/.askpass-`) &&
+      existsSync(askpassDir)
+    ) {
+      await rm(askpassDir, { recursive: true, force: true });
     }
   }
 }
@@ -168,6 +209,7 @@ async function runGit(
   args: string[],
   cwd: string,
   token: string,
+  extraEnv: Record<string, string> = {},
 ): Promise<string> {
   return new Promise((resolve, reject) => {
     const proc = spawn('git', args, {
@@ -175,9 +217,12 @@ async function runGit(
       env: {
         PATH: process.env.PATH ?? '/usr/bin:/bin',
         // Disable terminal prompts — if credentials fail we want
-        // a clean non-zero exit, not a hung process.
+        // a clean non-zero exit, not a hung process. GIT_ASKPASS
+        // (when set in extraEnv) takes precedence over the
+        // default 'echo' fallback.
         GIT_TERMINAL_PROMPT: '0',
         GIT_ASKPASS: 'echo',
+        ...extraEnv,
       },
     });
     let stdout = '';

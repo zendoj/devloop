@@ -282,7 +282,11 @@ async function deployOne(ds: DataSource, t: ApprovedTask): Promise<void> {
 
 async function verifyVerifying(ds: DataSource): Promise<void> {
   // Pick up tasks in verifying whose linked desired_state has
-  // applied_status='success', transition them to verified.
+  // applied_status='success' AND the host's reported applied_sha
+  // exactly matches both the SHA we signed (deploy_sha) AND the
+  // task's merged_commit_sha. The latter check is the
+  // belt-and-suspenders against a buggy or compromised host
+  // agent that returns success on a different commit.
   const rows = (await ds.query(
     `
     SELECT
@@ -295,6 +299,9 @@ async function verifyVerifying(ds: DataSource): Promise<void> {
     JOIN public.desired_state_history dsh ON dsh.id = at.applied_desired_state_id
     WHERE at.status = 'verifying'
       AND dsh.applied_status = 'success'
+      AND dsh.applied_sha IS NOT NULL
+      AND dsh.applied_sha = at.merged_commit_sha
+      AND dsh.applied_sha = dsh.deploy_sha
     ORDER BY at.created_at ASC
     LIMIT $1
     `,

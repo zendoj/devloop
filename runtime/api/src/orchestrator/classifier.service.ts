@@ -137,24 +137,48 @@ export class ClassifierService {
     if (!Array.isArray(r.rules)) {
       return DEFAULT_RULES;
     }
+    const validRiskTiers: RiskTier[] = ['low', 'standard', 'high', 'critical'];
+    const filteredRules = r.rules
+      .filter((x: unknown): x is ClassifierRule => {
+        if (typeof x !== 'object' || x === null) return false;
+        const rule = x as Record<string, unknown>;
+        if (typeof rule.match !== 'string' || rule.match.length === 0) return false;
+        if (typeof rule.module !== 'string' || rule.module.trim().length === 0) return false;
+        if (rule.module.length > 64) return false;
+        if (
+          typeof rule.risk_tier !== 'string' ||
+          !validRiskTiers.includes(rule.risk_tier as RiskTier)
+        ) {
+          this.logger.warn(
+            `classifier rule has invalid risk_tier ${String(rule.risk_tier)} — discarded`,
+          );
+          return false;
+        }
+        return true;
+      })
+      .map((x) => ({
+        match: x.match,
+        module: x.module.trim(),
+        risk_tier: x.risk_tier,
+      }));
+
+    const defaultModule =
+      typeof r.default_module === 'string' &&
+      r.default_module.trim().length > 0 &&
+      r.default_module.length <= 64
+        ? r.default_module.trim()
+        : DEFAULT_RULES.default_module;
+
+    const defaultRiskTier: RiskTier =
+      typeof r.default_risk_tier === 'string' &&
+      validRiskTiers.includes(r.default_risk_tier as RiskTier)
+        ? (r.default_risk_tier as RiskTier)
+        : DEFAULT_RULES.default_risk_tier;
+
     return {
-      rules: r.rules.filter(
-        (x: unknown): x is ClassifierRule =>
-          typeof x === 'object' &&
-          x !== null &&
-          typeof (x as ClassifierRule).match === 'string' &&
-          typeof (x as ClassifierRule).module === 'string' &&
-          typeof (x as ClassifierRule).risk_tier === 'string',
-      ),
-      default_module:
-        typeof r.default_module === 'string'
-          ? r.default_module
-          : DEFAULT_RULES.default_module,
-      default_risk_tier:
-        typeof r.default_risk_tier === 'string' &&
-        ['low', 'standard', 'high', 'critical'].includes(r.default_risk_tier)
-          ? (r.default_risk_tier as RiskTier)
-          : DEFAULT_RULES.default_risk_tier,
+      rules: filteredRules,
+      default_module: defaultModule,
+      default_risk_tier: defaultRiskTier,
     };
   }
 }
