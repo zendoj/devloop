@@ -181,7 +181,7 @@ export class SystemService {
       SELECT
         s.id::text                 AS id,
         s.user_id::text            AS user_id,
-        u.username                 AS username,
+        u.email                    AS username,
         s.issued_at                AS created_at,
         s.last_seen_at,
         s.expires_at,
