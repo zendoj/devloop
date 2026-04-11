@@ -166,16 +166,26 @@ async function reviewOne(ds: DataSource, task: TaskForReview): Promise<void> {
   );
 
   // Step 1: fetch the diff via GitHub Compare API.
-  const diff = await fetchDiff(
+  const diffResult = await fetchDiff(
     task.github_owner,
     task.github_repo,
     task.base_sha,
     task.head_sha,
   );
-  if (diff === null) {
-    console.warn(`[rv] ${task.display_id} diff fetch failed — leaving in review`);
+  if (diffResult.kind === 'transient') {
+    console.warn(
+      `[rv] ${task.display_id} diff fetch transient failure — leaving in review for retry`,
+    );
     return;
   }
+  if (diffResult.kind === 'permanent') {
+    console.error(
+      `[rv] ${task.display_id} diff fetch permanent failure (${diffResult.reason}) — failing task`,
+    );
+    await failReviewTask(ds, task, `diff fetch failed: ${diffResult.reason}`);
+    return;
+  }
+  const diff = diffResult.body;
   const diffTrimmed =
     diff.length > MAX_DIFF_BYTES
       ? diff.slice(0, MAX_DIFF_BYTES) + `\n\n…(truncated, original ${diff.length} bytes)`
@@ -250,12 +260,17 @@ async function reviewOne(ds: DataSource, task: TaskForReview): Promise<void> {
   console.log(`[rv] ${task.display_id} → ${targetStatus}`);
 }
 
+type DiffResult =
+  | { kind: 'ok'; body: string }
+  | { kind: 'transient'; reason: string }
+  | { kind: 'permanent'; reason: string };
+
 async function fetchDiff(
   owner: string,
   repo: string,
   base: string,
   head: string,
-): Promise<string | null> {
+): Promise<DiffResult> {
   // GitHub returns the patch directly when Accept is the diff
   // media type. Compare endpoint accepts SHAs or branch names on
   // both sides; we already have the SHAs from the worker run.
@@ -272,17 +287,56 @@ async function fetchDiff(
   try {
     res = await fetch(url, { method: 'GET', headers });
   } catch (err) {
-    console.error(`[rv] fetchDiff network error: ${String(err)}`);
-    return null;
+    // Network-layer error: classify as transient.
+    return { kind: 'transient', reason: `network: ${String(err)}` };
   }
-  if (!res.ok) {
-    const body = await res.text().catch(() => '');
-    console.error(
-      `[rv] fetchDiff ${owner}/${repo} ${base}..${head} → HTTP ${res.status}: ${body.slice(0, 200)}`,
+  if (res.ok) {
+    return { kind: 'ok', body: await res.text() };
+  }
+  const body = await res.text().catch(() => '');
+  const snippet = body.slice(0, 200);
+  console.error(
+    `[rv] fetchDiff ${owner}/${repo} ${base}..${head} → HTTP ${res.status}: ${snippet}`,
+  );
+  // 5xx → upstream is sick, retry.
+  // 429 → rate-limited, retry.
+  // 401/403 → bad/expired token, permanent (operator must rotate).
+  // 404 → repo or compare missing, permanent.
+  // 422 → SHAs do not exist or unrelated, permanent.
+  // Other 4xx → permanent.
+  if (res.status >= 500 || res.status === 429) {
+    return { kind: 'transient', reason: `HTTP ${res.status}` };
+  }
+  return { kind: 'permanent', reason: `HTTP ${res.status}: ${snippet}` };
+}
+
+/**
+ * Fail a task that cannot be reviewed because the diff is
+ * permanently unfetchable. Transitions review → blocked with a
+ * clear reason in the failure_reason payload, releasing the
+ * module lock so other work can proceed.
+ */
+async function failReviewTask(
+  ds: DataSource,
+  task: TaskForReview,
+  reason: string,
+): Promise<void> {
+  try {
+    await ds.query(
+      `
+      SELECT public.fence_and_transition(
+        $1, $2::bigint, 'review'::public.task_status_enum,
+        'blocked'::public.task_status_enum,
+        $3::varchar(128), 'system'::public.actor_kind_enum,
+        jsonb_build_object('failure_reason', $4::text),
+        NULL::varchar(128)
+      )
+      `,
+      [task.task_id, task.lease_version, REVIEWER_ID, reason.slice(0, 1000)],
     );
-    return null;
+  } catch (err) {
+    console.error(`[rv] failReviewTask ${task.display_id} failed:`, err);
   }
-  return await res.text();
 }
 
 async function askModel(

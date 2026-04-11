@@ -139,28 +139,44 @@ async function retryQueued(ds: DataSource): Promise<void> {
   for (const task of rows) {
     if (!running) break;
     try {
-      const lease = (await ds.query(
-        `SELECT public.acquire_module_lock($1, $2, $3, $4) AS lease`,
-        [task.project_id, task.module, task.id, WORKER_ID],
-      )) as Array<{ lease: string | number | null }>;
-      if (lease[0]?.lease === null || lease[0]?.lease === undefined) {
-        // Still held by someone else — skip this iteration.
-        continue;
+      // Atomic: acquire module lock + transition queued_for_lock
+      // → assigned in a single DB transaction. Without the
+      // transaction, a process crash between the lock acquire
+      // and the fence_and_transition would leave the task in
+      // queued_for_lock while already holding the module lock —
+      // wedging it forever (no other lock holder, but the task
+      // never picked up by runOnce which polls 'assigned').
+      // PG rolls back both on crash so the next iteration
+      // retries cleanly from scratch.
+      const promoted = await ds.transaction(async (m) => {
+        const lease = (await m.query(
+          `SELECT public.acquire_module_lock($1, $2, $3, $4) AS lease`,
+          [task.project_id, task.module, task.id, WORKER_ID],
+        )) as Array<{ lease: string | number | null }>;
+        if (lease[0]?.lease === null || lease[0]?.lease === undefined) {
+          // Still held by someone else. Throw a sentinel so the
+          // outer catch can swallow it without logging an error.
+          throw new Error('LOCK_HELD');
+        }
+        await m.query(
+          `
+          SELECT public.fence_and_transition(
+            $1, $2::bigint, 'queued_for_lock'::public.task_status_enum,
+            'assigned'::public.task_status_enum,
+            $3::varchar(128), 'system'::public.actor_kind_enum,
+            jsonb_build_object('module_lease', $4::bigint),
+            NULL::varchar(128)
+          )
+          `,
+          [task.id, Number(task.lease_version), WORKER_ID, Number(lease[0].lease)],
+        );
+        return true;
+      });
+      if (promoted) {
+        console.log(`[wm] ${task.id} promoted queued_for_lock → assigned`);
       }
-      await ds.query(
-        `
-        SELECT public.fence_and_transition(
-          $1, $2::bigint, 'queued_for_lock'::public.task_status_enum,
-          'assigned'::public.task_status_enum,
-          $3::varchar(128), 'system'::public.actor_kind_enum,
-          jsonb_build_object('module_lease', $4::int),
-          NULL::varchar(128)
-        )
-        `,
-        [task.id, Number(task.lease_version), WORKER_ID, Number(lease[0].lease)],
-      );
-      console.log(`[wm] ${task.id} promoted queued_for_lock → assigned`);
     } catch (err) {
+      if ((err as Error).message === 'LOCK_HELD') continue;
       console.error(`[wm] retry promote ${task.id} failed:`, err);
     }
   }
