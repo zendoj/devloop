@@ -84,7 +84,7 @@ export default function LoginPage(): React.ReactElement {
 
   return (
     <div className="center">
-      <div className="card">
+      <div className="auth-card">
         <h1 className="brand">DevLoop</h1>
         <p className="tagline">
           {stage.kind === 'password'

@@ -52,16 +52,25 @@ export default async function ProjectsPage(): Promise<React.ReactElement> {
         </p>
       </div>
 
+      <div className="page-actions">
+        <Link href="/projects/new" className="btn btn-primary">
+          + Register project
+        </Link>
+      </div>
+
       {items.length === 0 ? (
         <div className="empty">
-          <div className="empty-phase">Fas 1c</div>
+          <div className="empty-phase">Empty</div>
           <h2 className="empty-title">No projects yet</h2>
           <p className="empty-body">
-            Once the project registration flow lands, host projects will
-            appear here. For now the table reads <code>public.projects</code>{' '}
-            directly — insert a row via psql as{' '}
-            <code>devloop_owner</code> to see it render.
+            Register your first host project to start pushing bug reports
+            into DevLoop. You can also insert a row directly into{' '}
+            <code>public.projects</code> via psql as{' '}
+            <code>devloop_owner</code>.
           </p>
+          <Link href="/projects/new" className="btn btn-primary">
+            + Register project
+          </Link>
         </div>
       ) : (
         <div className="card">
@@ -79,11 +88,17 @@ export default async function ProjectsPage(): Promise<React.ReactElement> {
             </thead>
             <tbody>
               {items.map((p) => (
-                <tr key={p.id}>
+                <tr key={p.id} className="row-link">
                   <td className="mono">
-                    <Link href={`/projects/${p.slug}`}>{p.slug}</Link>
+                    <Link href={`/projects/${p.slug}`} className="row-cell">
+                      {p.slug}
+                    </Link>
                   </td>
-                  <td>{p.name}</td>
+                  <td>
+                    <Link href={`/projects/${p.slug}`} className="row-cell">
+                      {p.name}
+                    </Link>
+                  </td>
                   <td>
                     <span className={`pill pill-${p.status}`}>{p.status}</span>
                   </td>

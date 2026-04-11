@@ -4,13 +4,20 @@ import { ConfigModule } from './config/config.module';
 import { DbModule } from './db/db.module';
 import { HealthController } from './health/health.controller';
 import { ProjectsModule } from './projects/projects.module';
+import { ReportsModule } from './reports/reports.module';
 
 /**
  * Root module. Fas 0.9 wires the DB data source, file-backed secrets,
- * and auth. Fas 1b adds the projects list endpoint.
+ * and auth. Fas 1b adds projects, Fas 1c adds reports intake.
  */
 @Module({
-  imports: [ConfigModule, DbModule, AuthModule, ProjectsModule],
+  imports: [
+    ConfigModule,
+    DbModule,
+    AuthModule,
+    ProjectsModule,
+    ReportsModule,
+  ],
   controllers: [HealthController],
 })
 export class AppModule {}
