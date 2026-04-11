@@ -247,22 +247,23 @@ async function processOne(
     return;
   }
 
-  // Step 3: actually run the worker. If the GitHub token was not
-  // provisioned, fall back to a sleep-only stub so the state
-  // machine still progresses (useful for staging environments
-  // without push access).
+  // Step 3: actually run the worker. If the GitHub token is
+  // missing, fail the task explicitly with a clear reason
+  // instead of fake-stamping fake SHAs and stranding the task
+  // in 'review' (the reviewer would never be able to fetch a
+  // diff for SHAs that do not exist on GitHub).
   let result: WorkerRunResult;
   if (GITHUB_TOKEN === null) {
-    console.warn('[wm] no github_token — running sleep-only stub');
-    await sleep(400);
-    result = {
-      branch_name: `devloop/task/${ctx.display_id.toLowerCase()}`,
-      base_sha: '0000000',
-      head_sha: '0000000',
-      files_changed: [],
-      summary: 'no token — sleep-only stub',
-    };
-  } else {
+    console.error('[wm] no github_token — failing task explicitly');
+    await failTask(
+      ds,
+      taskId,
+      currentLease,
+      'github_token not provisioned on this host',
+    );
+    return;
+  }
+  {
     try {
       result = await runWorkerStub({
         taskId: ctx.task_id,

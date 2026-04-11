@@ -178,42 +178,12 @@ async function deployOne(ds: DataSource, t: ApprovedTask): Promise<void> {
     `[dp] ${t.display_id} deploying ${t.branch_name} head=${t.head_sha.slice(0, 7)}`,
   );
 
-  // Step 1: approved → deploying (acquires deploy_mutex).
-  const r1 = (await ds.query(
-    `
-    SELECT public.fence_and_transition(
-      $1, $2::bigint, 'approved'::public.task_status_enum,
-      'deploying'::public.task_status_enum,
-      $3::varchar(128), 'system'::public.actor_kind_enum,
-      jsonb_build_object('deployer_id', $3::text),
-      $3::varchar(128)
-    ) AS new_lease
-    `,
-    [t.task_id, t.lease_version, DEPLOYER_ID],
-  )) as Array<{ new_lease: string | number }>;
-  let currentLease = Number(r1[0]?.new_lease ?? t.lease_version);
-
-  // Step 2: deploying → merged. We do NOT actually merge a PR on
-  // GitHub in this phase. Use the worker's head_sha as the
-  // merged_commit_sha for state-machine purposes. The branch is
-  // available on the repo for a human to merge.
-  const mergedSha = t.head_sha;
-  const r2 = (await ds.query(
-    `
-    SELECT public.fence_and_transition(
-      $1, $2::bigint, 'deploying'::public.task_status_enum,
-      'merged'::public.task_status_enum,
-      $3::varchar(128), 'system'::public.actor_kind_enum,
-      jsonb_build_object('merged_commit_sha', $4::text),
-      $3::varchar(128)
-    ) AS new_lease
-    `,
-    [t.task_id, currentLease, DEPLOYER_ID, mergedSha],
-  )) as Array<{ new_lease: string | number }>;
-  currentLease = Number(r2[0]?.new_lease ?? currentLease);
-
-  // Step 3: build + sign desired_state, call record_desired_state.
+  // Step 0: build + sign desired_state OUTSIDE the transaction.
+  // The signature is deterministic given the inputs and is
+  // pure compute, so doing it before the transaction shortens
+  // the lock window on agent_tasks/deploy_mutex inside the txn.
   const issuedAt = new Date().toISOString();
+  const mergedSha = t.head_sha;
   const desired = {
     project_id: t.project_id,
     deploy_sha: mergedSha,
@@ -230,53 +200,92 @@ async function deployOne(ds: DataSource, t: ApprovedTask): Promise<void> {
     throw new Error(`bad ed25519 signature length ${signature.length}`);
   }
 
-  const r3 = (await ds.query(
-    `
-    SELECT public.record_desired_state(
-      $1::uuid,
-      $2::varchar(64),
-      $3::varchar(64),
-      'deploy'::public.desired_action_enum,
-      $4::varchar(128),
-      $5::varchar(64),
-      $6::bytea,
-      $7::bytea,
-      $8::uuid,
-      NULL::uuid
-    ) AS desired_state_id
-    `,
-    [
-      t.project_id,
-      mergedSha,
-      t.base_sha,
-      t.default_branch,
-      ACTIVE_KEY_ID,
-      signedBytes,
-      signature,
-      t.task_id,
-    ],
-  )) as Array<{ desired_state_id: string }>;
-  const desiredStateId = r3[0]?.desired_state_id;
-  if (!desiredStateId) {
-    throw new Error('record_desired_state returned no id');
-  }
+  // Wrap all four DB steps in a single transaction so a process
+  // crash mid-deploy never strands a task in 'merged' or
+  // 'deploying'. PG rolls back on disconnect: the task stays
+  // 'approved', the deploy_mutex is released, and the next
+  // deployer iteration retries from scratch.
+  const desiredStateId = await ds.transaction(async (m) => {
+    // Step 1: approved → deploying (acquires deploy_mutex).
+    const r1 = (await m.query(
+      `
+      SELECT public.fence_and_transition(
+        $1, $2::bigint, 'approved'::public.task_status_enum,
+        'deploying'::public.task_status_enum,
+        $3::varchar(128), 'system'::public.actor_kind_enum,
+        jsonb_build_object('deployer_id', $3::text),
+        $3::varchar(128)
+      ) AS new_lease
+      `,
+      [t.task_id, t.lease_version, DEPLOYER_ID],
+    )) as Array<{ new_lease: string | number }>;
+    let currentLease = Number(r1[0]?.new_lease ?? t.lease_version);
 
-  // Step 4: merged → verifying with applied_desired_state_id.
-  const r4 = (await ds.query(
-    `
-    SELECT public.fence_and_transition(
-      $1, $2::bigint, 'merged'::public.task_status_enum,
-      'verifying'::public.task_status_enum,
-      $3::varchar(128), 'system'::public.actor_kind_enum,
-      jsonb_build_object('applied_desired_state_id', $4::text),
-      $3::varchar(128)
-    ) AS new_lease
-    `,
-    [t.task_id, currentLease, DEPLOYER_ID, desiredStateId],
-  )) as Array<{ new_lease: string | number }>;
-  currentLease = Number(r4[0]?.new_lease ?? currentLease);
+    // Step 2: deploying → merged.
+    const r2 = (await m.query(
+      `
+      SELECT public.fence_and_transition(
+        $1, $2::bigint, 'deploying'::public.task_status_enum,
+        'merged'::public.task_status_enum,
+        $3::varchar(128), 'system'::public.actor_kind_enum,
+        jsonb_build_object('merged_commit_sha', $4::text),
+        $3::varchar(128)
+      ) AS new_lease
+      `,
+      [t.task_id, currentLease, DEPLOYER_ID, mergedSha],
+    )) as Array<{ new_lease: string | number }>;
+    currentLease = Number(r2[0]?.new_lease ?? currentLease);
+
+    // Step 3: record signed desired_state.
+    const r3 = (await m.query(
+      `
+      SELECT public.record_desired_state(
+        $1::uuid,
+        $2::varchar(64),
+        $3::varchar(64),
+        'deploy'::public.desired_action_enum,
+        $4::varchar(128),
+        $5::varchar(64),
+        $6::bytea,
+        $7::bytea,
+        $8::uuid,
+        NULL::uuid
+      ) AS desired_state_id
+      `,
+      [
+        t.project_id,
+        mergedSha,
+        t.base_sha,
+        t.default_branch,
+        ACTIVE_KEY_ID,
+        signedBytes,
+        signature,
+        t.task_id,
+      ],
+    )) as Array<{ desired_state_id: string }>;
+    const dsi = r3[0]?.desired_state_id;
+    if (!dsi) {
+      throw new Error('record_desired_state returned no id');
+    }
+
+    // Step 4: merged → verifying with applied_desired_state_id.
+    await m.query(
+      `
+      SELECT public.fence_and_transition(
+        $1, $2::bigint, 'merged'::public.task_status_enum,
+        'verifying'::public.task_status_enum,
+        $3::varchar(128), 'system'::public.actor_kind_enum,
+        jsonb_build_object('applied_desired_state_id', $4::text),
+        $3::varchar(128)
+      )
+      `,
+      [t.task_id, currentLease, DEPLOYER_ID, dsi],
+    );
+    return dsi;
+  });
+
   console.log(
-    `[dp] ${t.display_id} → verifying lease=${currentLease} desired_state=${desiredStateId.slice(0, 8)}`,
+    `[dp] ${t.display_id} → verifying desired_state=${desiredStateId.slice(0, 8)}`,
   );
 }
 
