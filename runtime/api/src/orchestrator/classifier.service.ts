@@ -138,13 +138,28 @@ export class ClassifierService {
       return DEFAULT_RULES;
     }
     const validRiskTiers: RiskTier[] = ['low', 'standard', 'high', 'critical'];
+    // Module names flow into module_locks.module, audit payloads,
+    // logs, and git branch derivatives. Restrict to a sane
+    // charset so a malformed config row cannot inject whitespace
+    // or control characters downstream. Matches the pattern
+    // worker-runtime enforces on branch names: lowercase alpha,
+    // digits, and safe path-ish punctuation.
+    const MODULE_CHARSET = /^[a-z0-9][a-z0-9/._-]*$/;
+
     const filteredRules = r.rules
       .filter((x: unknown): x is ClassifierRule => {
         if (typeof x !== 'object' || x === null) return false;
         const rule = x as Record<string, unknown>;
         if (typeof rule.match !== 'string' || rule.match.length === 0) return false;
-        if (typeof rule.module !== 'string' || rule.module.trim().length === 0) return false;
-        if (rule.module.length > 64) return false;
+        if (typeof rule.module !== 'string') return false;
+        const m = rule.module.trim();
+        if (m.length === 0 || m.length > 64) return false;
+        if (!MODULE_CHARSET.test(m)) {
+          this.logger.warn(
+            `classifier rule module '${m}' has invalid characters — discarded`,
+          );
+          return false;
+        }
         if (
           typeof rule.risk_tier !== 'string' ||
           !validRiskTiers.includes(rule.risk_tier as RiskTier)
@@ -162,11 +177,13 @@ export class ClassifierService {
         risk_tier: x.risk_tier,
       }));
 
+    const defaultModuleRaw =
+      typeof r.default_module === 'string' ? r.default_module.trim() : '';
     const defaultModule =
-      typeof r.default_module === 'string' &&
-      r.default_module.trim().length > 0 &&
-      r.default_module.length <= 64
-        ? r.default_module.trim()
+      defaultModuleRaw.length > 0 &&
+      defaultModuleRaw.length <= 64 &&
+      MODULE_CHARSET.test(defaultModuleRaw)
+        ? defaultModuleRaw
         : DEFAULT_RULES.default_module;
 
     const defaultRiskTier: RiskTier =

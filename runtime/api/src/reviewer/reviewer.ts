@@ -37,6 +37,29 @@ const BATCH_SIZE = 3;
 const MAX_DIFF_BYTES = 80 * 1024;
 const MODEL = 'gpt-5.4';
 
+// Review score gate: approved verdicts with a score below this
+// threshold are downgraded to changes_requested. Matches the
+// "intentionally generous — approved ~60" doc in the system
+// prompt for DevLoop Fas 3 stub diffs.
+const MIN_APPROVAL_SCORE = 60;
+
+// Advisory lock namespace key for reviewer claims. Two reviewer
+// instances calling pg_try_advisory_lock with the same (class,
+// task_id_hash) will see exactly one succeed; the other skips
+// the task entirely without fetching the diff or calling OpenAI.
+const REVIEWER_LOCK_CLASS = hashInt('devloop:reviewer_claim');
+
+function hashInt(s: string): number {
+  // Cheap 32-bit hash (same shape as pg's hashtext result range
+  // for int). Deterministic, no crypto needed — this is just a
+  // namespace key for advisory locks.
+  let h = 0;
+  for (let i = 0; i < s.length; i++) {
+    h = (h * 31 + s.charCodeAt(i)) | 0;
+  }
+  return h;
+}
+
 const REVIEWER_ID = `rv-${process.pid}-${Date.now().toString(36)}`;
 
 let running = true;
@@ -161,6 +184,53 @@ async function runOnce(ds: DataSource): Promise<void> {
 }
 
 async function reviewOne(ds: DataSource, task: TaskForReview): Promise<void> {
+  // Step 0: try to claim the task via a SESSION-scoped advisory
+  // lock on a dedicated connection. Two reviewer instances
+  // polling the same batch will both see this row in 'review'
+  // + decision IS NULL; the first to call pg_try_advisory_lock
+  // gets the claim, the second returns false and we skip
+  // without fetching the diff or calling OpenAI.
+  //
+  // Session-scoped lock (NOT transaction-scoped) lets us hold
+  // the claim across the external OpenAI call without keeping
+  // a long-running transaction open. The lock is released
+  // explicitly in finally. On process crash PG drops the
+  // session and the lock goes with it.
+  const qr = ds.createQueryRunner();
+  await qr.connect();
+  let claimed = false;
+  try {
+    const claimRows = (await qr.query(
+      `SELECT pg_try_advisory_lock($1::int, hashtext($2::text)::int) AS ok`,
+      [REVIEWER_LOCK_CLASS, task.task_id],
+    )) as Array<{ ok: boolean }>;
+    if (claimRows[0]?.ok !== true) {
+      console.log(
+        `[rv] ${task.display_id} already claimed by another reviewer — skipping`,
+      );
+      return;
+    }
+    claimed = true;
+    await reviewOneClaimed(ds, task);
+  } finally {
+    if (claimed) {
+      try {
+        await qr.query(
+          `SELECT pg_advisory_unlock($1::int, hashtext($2::text)::int)`,
+          [REVIEWER_LOCK_CLASS, task.task_id],
+        );
+      } catch (err) {
+        console.warn(`[rv] advisory_unlock failed: ${String(err)}`);
+      }
+    }
+    await qr.release();
+  }
+}
+
+async function reviewOneClaimed(
+  ds: DataSource,
+  task: TaskForReview,
+): Promise<void> {
   console.log(
     `[rv] ${task.display_id} reviewing branch=${task.branch_name} ${task.base_sha.slice(0, 7)}..${task.head_sha.slice(0, 7)}`,
   );
@@ -198,6 +268,22 @@ async function reviewOne(ds: DataSource, task: TaskForReview): Promise<void> {
   } catch (err) {
     console.error(`[rv] ${task.display_id} model call failed:`, err);
     return;
+  }
+
+  // Score gate: an approved verdict with a score below the
+  // minimum is downgraded to changes_requested. The model
+  // contradicted itself — prefer the conservative outcome
+  // over letting a "looks unsafe, score 12, but approved!"
+  // response slip through to deployment.
+  if (verdict.decision === 'approved' && verdict.score < MIN_APPROVAL_SCORE) {
+    console.warn(
+      `[rv] ${task.display_id} downgrading approved→changes_requested (score=${verdict.score} < ${MIN_APPROVAL_SCORE})`,
+    );
+    verdict = {
+      decision: 'changes_requested',
+      score: verdict.score,
+      summary: `downgraded from approved due to low score (${verdict.score}): ${verdict.summary}`,
+    };
   }
   console.log(
     `[rv] ${task.display_id} verdict ${verdict.decision} score=${verdict.score}`,
@@ -422,15 +508,20 @@ Return your verdict as JSON now.`;
   if (decision !== 'approved' && decision !== 'changes_requested') {
     throw new Error(`bad decision: ${String(decision)}`);
   }
-  if (typeof score !== 'number' || score < 0 || score > 100) {
-    throw new Error(`bad score: ${String(score)}`);
+  if (
+    typeof score !== 'number' ||
+    !Number.isInteger(score) ||
+    score < 0 ||
+    score > 100
+  ) {
+    throw new Error(`bad score: ${String(score)} (must be integer 0..100)`);
   }
   if (typeof summary !== 'string') {
     throw new Error('bad summary');
   }
   return {
     decision,
-    score: Math.round(score),
+    score,
     summary: summary.slice(0, 500),
   };
 }
