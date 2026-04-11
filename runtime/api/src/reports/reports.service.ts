@@ -41,6 +41,12 @@ export interface CreateReportInput {
   title: string;
   description: string;
   reporterUserId: string | null;
+  attachments?: Array<{
+    name: string;
+    mime_type: string;
+    content_base64: string;
+    size: number;
+  }>;
 }
 
 export interface AddThreadInput {
@@ -271,6 +277,21 @@ export class ReportsService {
         out_status: string | null;
       }>;
       const taskId = taskRows[0]?.out_task_id ?? null;
+
+      // Fas I: persist rich-report attachments. All in the same
+      // transaction as the report insert + orchestrate_task so a
+      // crash mid-intake rolls everything back and the CRM can
+      // retry with the same body cleanly.
+      for (const a of input.attachments ?? []) {
+        await manager.query(
+          `
+          INSERT INTO public.report_attachments
+            (report_id, name, mime_type, size_bytes, content_base64)
+          VALUES ($1, $2, $3, $4, $5)
+          `,
+          [reportId, a.name, a.mime_type, a.size, a.content_base64],
+        );
+      }
 
       return { report_id: reportId, task_id: taskId };
     });

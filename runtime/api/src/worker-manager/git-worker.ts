@@ -65,6 +65,13 @@ export interface WorkerRunInput {
     files: Array<{ name: string; size: number; content: string }>;
     reported_at: string;
   }>;
+  /** Rich-report attachments from report_attachments (screenshots, logs) */
+  attachments: Array<{
+    name: string;
+    mime_type: string;
+    content_base64: string;
+    size: number;
+  }>;
   githubToken: string;
   workerId: string;
 }
@@ -181,6 +188,18 @@ esac
       }
     }
 
+    // Fas I: rich-report attachments (screenshot, console log,
+    // network log, state dump, element selector). Dropped into
+    // .devloop/attachments/ so Claude can open them directly.
+    if (input.attachments.length > 0) {
+      const attachDir = `${devloopDir}/attachments`;
+      await mkdir(attachDir, { recursive: true });
+      for (const a of input.attachments) {
+        const bytes = Buffer.from(a.content_base64, 'base64');
+        await writeFile(`${attachDir}/${a.name}`, bytes);
+      }
+    }
+
     // Hand the task to Claude. It runs inside workDir with Read/
     // Edit/Write + a narrow Bash allowlist and is capped by a USD
     // budget. If Claude errors or makes no file changes we fail
@@ -192,6 +211,7 @@ esac
       input.reportBody,
       input.plan,
       input.feedback.length > 0,
+      input.attachments.length > 0,
     );
 
     // Before staging, strip .devloop/ out of the worktree — it's
@@ -350,6 +370,7 @@ async function runClaude(
   body: string,
   plan: string | null,
   hasPriorFeedback: boolean,
+  hasAttachments: boolean,
 ): Promise<ClaudeResult> {
   const systemPromptLines = [
     'You are DevLoop Worker, an autonomous bug-fixer running inside',
@@ -371,6 +392,15 @@ async function runClaude(
       '                        Read every attempt-N/feedback.md and any',
       '                        attached screenshots/logs. Address',
       '                        each concern before making your fix.',
+    );
+  }
+  if (hasAttachments) {
+    systemPromptLines.push(
+      '  .devloop/attachments/ — rich bug-report artifacts:',
+      '                        screenshot.png, console.log,',
+      '                        network.log, state.json, element.json.',
+      '                        Read them to understand EXACTLY what',
+      '                        the user saw when filing the report.',
     );
   }
   systemPromptLines.push(
@@ -417,6 +447,20 @@ async function runClaude(
       'tried in the running product. Read every file under',
       '.devloop/feedback/ and make sure your new attempt addresses',
       'each issue raised.',
+    );
+  }
+  if (hasAttachments) {
+    userPromptParts.push(
+      '',
+      '## Rich bug-report attachments',
+      '',
+      'The bug reporter captured runtime state when they filed',
+      'this report. Look in .devloop/attachments/ — there may be',
+      'a screenshot showing the broken state, a console.log with',
+      'the JS errors that happened right before the report, a',
+      'network.log with failed HTTP requests, and a state.json',
+      'with the client app state at the time. Use these to',
+      'pinpoint the exact root cause before you start editing.',
     );
   }
   const userPrompt = userPromptParts.join('\n');

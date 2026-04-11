@@ -229,6 +229,12 @@ interface TaskContext {
     files: Array<{ name: string; size: number; content: string }>;
     reported_at: string;
   }>;
+  attachments: Array<{
+    name: string;
+    mime_type: string;
+    content_base64: string;
+    size: number;
+  }>;
 }
 
 async function processOne(
@@ -299,6 +305,7 @@ async function processOne(
         reportBody: ctx.report_body,
         plan: ctx.plan,
         feedback: ctx.feedback,
+        attachments: ctx.attachments,
         githubToken: GITHUB_TOKEN,
         workerId: WORKER_ID,
       });
@@ -413,6 +420,21 @@ async function loadTaskContext(
   )) as TaskContext['feedback'];
   ctx.feedback = feedback ?? [];
   ctx.plan = ctx.plan ?? null;
+
+  // Fas I: load rich-report attachments (screenshot, console log,
+  // etc.) so the worker can drop them into .devloop/attachments/
+  // for Claude to read via --add-dir.
+  const attachments = (await ds.query(
+    `
+    SELECT name, mime_type, content_base64, size_bytes AS size
+      FROM public.report_attachments
+     WHERE report_id = $1
+     ORDER BY id ASC
+    `,
+    [ctx.report_id],
+  )) as TaskContext['attachments'];
+  ctx.attachments = attachments ?? [];
+
   return ctx;
 }
 

@@ -66,6 +66,40 @@ export class HostReportsController {
         ? body.description
         : `${body.description}\n\n---\n\n\`\`\`\n${body.metadata}\n\`\`\``;
 
+    // Fas I: rich-report attachments (screenshot, console log,
+    // network log, state dump). Per-attachment 2 MB, total 8 MB.
+    // Anything bigger the DevLoop intake rejects as 413 so the
+    // CRM widget can decide to trim/drop before re-sending.
+    const MAX_ATTACHMENT_BYTES = 2 * 1024 * 1024;
+    const MAX_TOTAL_BYTES = 8 * 1024 * 1024;
+    const attachments: Array<{
+      name: string;
+      mime_type: string;
+      content_base64: string;
+      size: number;
+    }> = [];
+    let totalBytes = 0;
+    for (const a of body.attachments ?? []) {
+      const buf = Buffer.from(a.content_base64, 'base64');
+      if (buf.length > MAX_ATTACHMENT_BYTES) {
+        throw new BadRequestException(
+          `attachment ${a.name} too large (${buf.length} > ${MAX_ATTACHMENT_BYTES} bytes)`,
+        );
+      }
+      totalBytes += buf.length;
+      if (totalBytes > MAX_TOTAL_BYTES) {
+        throw new BadRequestException(
+          `total attachment size exceeds ${MAX_TOTAL_BYTES} bytes`,
+        );
+      }
+      attachments.push({
+        name: a.name.replace(/[^a-zA-Z0-9._-]/g, '_').slice(0, 255),
+        mime_type: a.mime_type ?? 'application/octet-stream',
+        content_base64: a.content_base64,
+        size: buf.length,
+      });
+    }
+
     try {
       return await this.reports.create({
         projectId: host.project_id,
@@ -75,6 +109,7 @@ export class HostReportsController {
         // reporter_user_id stays NULL. The reporter's CRM
         // identity (if any) lives inside body.metadata.
         reporterUserId: null,
+        attachments,
       });
     } catch (err) {
       const msg = (err as Error).message;

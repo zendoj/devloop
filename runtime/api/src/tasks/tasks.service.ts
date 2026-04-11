@@ -202,8 +202,86 @@ export class TasksService {
       [id],
     )) as Array<TaskFeedbackRow>;
 
+    const threads = (await this.ds.query(
+      `
+      SELECT
+        id::text       AS id,
+        author_kind::text AS author_kind,
+        author_name,
+        body,
+        created_at
+      FROM public.report_threads
+      WHERE report_id = $1
+      ORDER BY created_at ASC
+      `,
+      [task.report_id],
+    )) as Array<ThreadRow>;
+
+    const attachments = (await this.ds.query(
+      `
+      SELECT
+        id::int        AS id,
+        name,
+        mime_type,
+        size_bytes     AS size,
+        content_base64,
+        created_at
+      FROM public.report_attachments
+      WHERE report_id = $1
+      ORDER BY id ASC
+      `,
+      [task.report_id],
+    )) as Array<ReportAttachmentRow>;
+
     task.feedback = feedback;
+    task.threads = threads;
+    task.attachments = attachments;
     return task;
+  }
+
+  /**
+   * Append a user-written message to the report thread attached
+   * to this task. The thread lives on the report, not the task —
+   * all attempts at fixing the same bug share one conversation.
+   */
+  public async addThreadMessage(
+    taskId: string,
+    authorName: string,
+    body: string,
+  ): Promise<{ id: string }> {
+    // Look up the report_id for the task. Narrow SELECT so we
+    // don't fetch the whole detail just to insert a thread.
+    const rows = (await this.ds.query(
+      `SELECT report_id::text AS report_id FROM public.agent_tasks WHERE id = $1`,
+      [taskId],
+    )) as Array<{ report_id: string }>;
+    const reportId = rows[0]?.report_id;
+    if (!reportId) {
+      throw new Error('task not found');
+    }
+
+    const trimmedBody = body.trim();
+    const trimmedAuthor = authorName.trim();
+    if (trimmedBody.length === 0 || trimmedBody.length > 10_000) {
+      throw new Error('body must be 1..10000 chars');
+    }
+    if (trimmedAuthor.length === 0 || trimmedAuthor.length > 128) {
+      throw new Error('author_name must be 1..128 chars');
+    }
+
+    const inserted = (await this.ds.query(
+      `
+      INSERT INTO public.report_threads (report_id, author_kind, author_name, body)
+      VALUES ($1, 'user'::public.thread_author_enum, $2, $3)
+      RETURNING id::text AS id
+      `,
+      [reportId, trimmedAuthor, trimmedBody],
+    )) as Array<{ id: string }>;
+    const id = inserted[0]?.id;
+    if (!id) {
+      throw new Error('thread insert did not return id');
+    }
+    return { id };
   }
 
   /**
@@ -341,6 +419,17 @@ export interface TaskDetail {
   human_approved_at: string | null;
   failure_reason: string | null;
   feedback?: TaskFeedbackRow[];
+  threads?: ThreadRow[];
+  attachments?: ReportAttachmentRow[];
+}
+
+export interface ReportAttachmentRow {
+  id: number;
+  name: string;
+  mime_type: string;
+  size: number;
+  content_base64: string;
+  created_at: string;
 }
 
 export interface TaskFeedbackRow {
@@ -349,4 +438,12 @@ export interface TaskFeedbackRow {
   feedback_text: string;
   files: Array<{ name: string; size: number; content: string }>;
   reported_at: string;
+}
+
+export interface ThreadRow {
+  id: string;
+  author_kind: string;
+  author_name: string;
+  body: string;
+  created_at: string;
 }

@@ -31,6 +31,10 @@ interface RejectBody {
   files?: Array<{ name: string; content_base64: string }>;
 }
 
+interface ThreadBody {
+  body: string;
+}
+
 @Controller('api')
 @UseGuards(SessionGuard)
 export class TasksController {
@@ -128,6 +132,32 @@ export class TasksController {
       throw new BadRequestException((err as Error).message);
     }
     return { ok: true };
+  }
+
+  @Post('tasks/:id/thread')
+  @HttpCode(HttpStatus.OK)
+  public async addThread(
+    @Req() req: RequestWithSession,
+    @Param('id') id: string,
+    @Body() body: ThreadBody,
+  ): Promise<{ id: string }> {
+    const session = req.session;
+    if (!session) throw new UnauthorizedException('unauthorized');
+    if (!/^[0-9a-f-]{36}$/i.test(id)) {
+      throw new BadRequestException('invalid id');
+    }
+    if (!body || typeof body.body !== 'string') {
+      throw new BadRequestException('body required');
+    }
+    try {
+      return await this.tasks.addThreadMessage(
+        id,
+        `user:${session.userId}`,
+        body.body,
+      );
+    } catch (err) {
+      throw new BadRequestException((err as Error).message);
+    }
   }
 
   @Get('overview/stats')

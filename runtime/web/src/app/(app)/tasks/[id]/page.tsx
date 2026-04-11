@@ -2,6 +2,7 @@ import { cookies } from 'next/headers';
 import Link from 'next/link';
 import { apiFetchServer } from '@/lib/api';
 import { ApproveRejectPanel } from './ApproveRejectPanel';
+import { ThreadPanel } from './ThreadPanel';
 
 export const dynamic = 'force-dynamic';
 
@@ -42,6 +43,21 @@ interface TaskDetail {
     feedback_text: string;
     files: Array<{ name: string; size: number; content: string }>;
     reported_at: string;
+  }>;
+  threads?: Array<{
+    id: string;
+    author_kind: string;
+    author_name: string;
+    body: string;
+    created_at: string;
+  }>;
+  attachments?: Array<{
+    id: number;
+    name: string;
+    mime_type: string;
+    size: number;
+    content_base64: string;
+    created_at: string;
   }>;
 }
 
@@ -287,10 +303,87 @@ export default async function TaskDetailPage({
         </section>
       )}
 
+      {task.attachments && task.attachments.length > 0 && (
+        <section style={{ marginBottom: 24 }}>
+          <h2 style={{ fontSize: 14, fontWeight: 600, marginBottom: 6 }}>
+            Bug-report attachments
+          </h2>
+          <div
+            className="card"
+            style={{
+              padding: 14,
+              display: 'flex',
+              flexDirection: 'column',
+              gap: 10,
+            }}
+          >
+            {task.attachments.map((a) => {
+              const isImage = a.mime_type.startsWith('image/');
+              const isText =
+                a.mime_type.startsWith('text/') ||
+                a.mime_type === 'application/json';
+              return (
+                <div key={a.id} style={{ fontSize: 12 }}>
+                  <div style={{ color: '#8a8f99', marginBottom: 4 }}>
+                    <code>{a.name}</code>{' '}
+                    <span style={{ color: '#6b7280' }}>
+                      {a.mime_type} · {a.size}B
+                    </span>
+                  </div>
+                  {isImage ? (
+                    // eslint-disable-next-line @next/next/no-img-element
+                    <img
+                      src={`data:${a.mime_type};base64,${a.content_base64}`}
+                      alt={a.name}
+                      style={{
+                        maxWidth: '100%',
+                        maxHeight: 320,
+                        borderRadius: 4,
+                        border: '1px solid #2a2f3a',
+                      }}
+                    />
+                  ) : isText ? (
+                    <pre
+                      style={{
+                        fontSize: 11,
+                        color: '#c5c8d0',
+                        background: '#0f1117',
+                        padding: 8,
+                        borderRadius: 4,
+                        maxHeight: 240,
+                        overflow: 'auto',
+                        whiteSpace: 'pre-wrap',
+                        margin: 0,
+                      }}
+                    >
+                      {Buffer.from(a.content_base64, 'base64').toString('utf-8').slice(0, 8000)}
+                    </pre>
+                  ) : (
+                    <div style={{ color: '#6b7280' }}>
+                      (binary — {a.size} bytes)
+                    </div>
+                  )}
+                </div>
+              );
+            })}
+          </div>
+        </section>
+      )}
+
+      <section style={{ marginBottom: 24 }}>
+        <h2 style={{ fontSize: 14, fontWeight: 600, marginBottom: 6 }}>
+          Conversation
+        </h2>
+        <ThreadPanel
+          taskId={task.id}
+          initialThreads={task.threads ?? []}
+        />
+      </section>
+
       {task.feedback && task.feedback.length > 0 && (
         <section style={{ marginBottom: 24 }}>
           <h2 style={{ fontSize: 14, fontWeight: 600, marginBottom: 6 }}>
-            Human feedback history
+            Human rejection history
           </h2>
           <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
             {task.feedback.map((f) => (
