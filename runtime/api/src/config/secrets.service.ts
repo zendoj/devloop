@@ -21,10 +21,27 @@ export class SecretsService implements OnModuleInit {
   private readonly cache = new Map<string, Buffer>();
 
   public async onModuleInit(): Promise<void> {
-    // Eagerly load the two secrets the API needs today. Later phases may
-    // extend this list; each addition should be explicit, not lazy.
+    // Eagerly load the secrets the API needs today. Each addition
+    // should be explicit, not lazy. Worker Manager / Worker Runtime
+    // reuse the same SecretsService via DbModule indirection.
     this.loadSecret('jwt_secret', { minBytes: 32 });
     this.loadSecret('data_encryption_key', { exactBytes: 32 });
+    // github_token is OPTIONAL — the API itself does not need it.
+    // Only Fas 3 worker runtime needs it to clone + push. If the
+    // file is absent at API start we log and continue; the worker
+    // will throw on first use if it is actually needed.
+    this.tryLoadSecret('github_token', { minBytes: 8 });
+  }
+
+  private tryLoadSecret(
+    name: string,
+    opts: { exactBytes?: number; minBytes?: number },
+  ): void {
+    try {
+      this.loadSecret(name, opts);
+    } catch (err) {
+      this.logger.warn(`optional secret '${name}' not loaded: ${String(err)}`);
+    }
   }
 
   public getSecret(name: string): Buffer {

@@ -1,8 +1,10 @@
 /* eslint-disable no-console */
 import 'reflect-metadata';
 import { randomUUID } from 'node:crypto';
+import { readFileSync } from 'node:fs';
 import { DataSource } from 'typeorm';
 import { buildDataSource } from '../data-source';
+import { runWorkerStub, WorkerRunResult } from './git-worker';
 
 /**
  * DevLoop Worker Manager (Fas 2 skeleton).
@@ -47,11 +49,34 @@ import { buildDataSource } from '../data-source';
 
 const POLL_INTERVAL_MS = 2_000;
 const BATCH_SIZE = 5;
-const FAKE_WORK_MS = 400;
 
 const WORKER_ID = `wm-${process.pid}-${Date.now().toString(36)}`;
 
 let running = true;
+
+function loadGithubToken(): string | null {
+  // $CREDENTIALS_DIRECTORY (systemd LoadCredential) first, then
+  // /etc/devloop/github_token, then env var. Missing token is
+  // returned as null so non-git workflows can still run.
+  const credDir = process.env['CREDENTIALS_DIRECTORY'];
+  if (credDir) {
+    try {
+      return readFileSync(`${credDir}/github_token`, 'utf8').trim();
+    } catch {
+      /* fall through */
+    }
+  }
+  try {
+    return readFileSync('/etc/devloop/github_token', 'utf8').trim();
+  } catch {
+    /* fall through */
+  }
+  const env = process.env['DEVLOOP_GITHUB_TOKEN'];
+  if (env && env.length > 0) return env.trim();
+  return null;
+}
+
+const GITHUB_TOKEN = loadGithubToken();
 
 async function main(): Promise<void> {
   console.log(`[wm] starting worker manager ${WORKER_ID}`);
@@ -110,6 +135,20 @@ async function runOnce(ds: DataSource): Promise<void> {
   }
 }
 
+interface TaskContext {
+  task_id: string;
+  display_id: string;
+  module: string;
+  project_id: string;
+  project_slug: string;
+  github_owner: string;
+  github_repo: string;
+  default_branch: string;
+  report_id: string;
+  report_title: string;
+  report_body: string;
+}
+
 async function processOne(
   ds: DataSource,
   taskId: string,
@@ -117,10 +156,7 @@ async function processOne(
 ): Promise<void> {
   // Step 1: claim the assigned task. claim_assigned_task atomically
   // transitions status 'assigned' → 'in_progress' AND bumps
-  // lease_version in a single statement, so after this call the
-  // task is already in_progress. If the task has moved out of
-  // 'assigned' since the SELECT above, the function returns zero
-  // rows and we skip.
+  // lease_version in a single statement.
   const claimRows = (await ds.query(
     `
     SELECT out_lease_version, out_module, out_display_id
@@ -143,26 +179,156 @@ async function processOne(
     `[wm] ${claim.out_display_id ?? taskId} claimed + in_progress lease=${currentLease} module=${claim.out_module}`,
   );
 
-  // Step 2: simulate work. Real Claude sandbox invocation lives
-  // in Fas 3.
-  await sleep(FAKE_WORK_MS);
+  // Step 2: load the full task context (project repo, report
+  // body) needed by the worker runtime.
+  const ctx = await loadTaskContext(ds, taskId);
+  if (!ctx) {
+    console.warn(`[wm] ${taskId} context lookup failed — failing task`);
+    await failTask(ds, taskId, currentLease, 'context lookup failed');
+    return;
+  }
 
-  // Step 3: transition in_progress → review so the reviewer
-  // (Fas 4) can pick it up.
+  // Step 3: actually run the worker. If the GitHub token was not
+  // provisioned, fall back to a sleep-only stub so the state
+  // machine still progresses (useful for staging environments
+  // without push access).
+  let result: WorkerRunResult;
+  if (GITHUB_TOKEN === null) {
+    console.warn('[wm] no github_token — running sleep-only stub');
+    await sleep(400);
+    result = {
+      branch_name: `devloop/task/${ctx.display_id.toLowerCase()}`,
+      base_sha: '0000000',
+      head_sha: '0000000',
+      files_changed: [],
+      summary: 'no token — sleep-only stub',
+    };
+  } else {
+    try {
+      result = await runWorkerStub({
+        taskId: ctx.task_id,
+        displayId: ctx.display_id,
+        projectSlug: ctx.project_slug,
+        githubOwner: ctx.github_owner,
+        githubRepo: ctx.github_repo,
+        defaultBranch: ctx.default_branch,
+        reportTitle: ctx.report_title,
+        reportBody: ctx.report_body,
+        githubToken: GITHUB_TOKEN,
+        workerId: WORKER_ID,
+      });
+      console.log(
+        `[wm] ${ctx.display_id} pushed ${result.branch_name} head=${result.head_sha.slice(0, 7)}`,
+      );
+    } catch (err) {
+      console.error(`[wm] ${ctx.display_id} worker run failed:`, err);
+      await failTask(ds, taskId, currentLease, (err as Error).message);
+      return;
+    }
+  }
+
+  // Step 4: stamp the diff metadata via the SECURITY DEFINER
+  // helper. Returns false if the task moved out of in_progress
+  // (e.g. cancelled by janitor) — in that case bail out.
+  const stamped = (await ds.query(
+    `
+    SELECT public.record_worker_result(
+      $1, $2, $3, $4, $5::jsonb
+    ) AS ok
+    `,
+    [
+      taskId,
+      result.branch_name,
+      result.base_sha,
+      result.head_sha,
+      JSON.stringify(result.files_changed),
+    ],
+  )) as Array<{ ok: boolean }>;
+  if (stamped[0]?.ok !== true) {
+    console.warn(`[wm] ${ctx.display_id} record_worker_result returned false`);
+    return;
+  }
+
+  // Step 5: transition in_progress → review.
   const reviewRows = (await ds.query(
     `
     SELECT public.fence_and_transition(
       $1, $2::bigint, 'in_progress'::public.task_status_enum,
       'review'::public.task_status_enum,
       $3::varchar(128), 'system'::public.actor_kind_enum,
-      jsonb_build_object('worker_id', $3::text, 'stub', true, 'summary', 'stub work complete'),
+      jsonb_build_object(
+        'worker_id', $3::text,
+        'branch',    $4::text,
+        'head_sha',  $5::text,
+        'summary',   $6::text
+      ),
       $3::varchar(128)
     ) AS new_lease
     `,
-    [taskId, currentLease, WORKER_ID],
+    [
+      taskId,
+      currentLease,
+      WORKER_ID,
+      result.branch_name,
+      result.head_sha,
+      result.summary,
+    ],
   )) as Array<{ new_lease: string | number }>;
   currentLease = Number(reviewRows[0]?.new_lease ?? currentLease);
-  console.log(`[wm] ${taskId} review lease=${currentLease} (handed off)`);
+  console.log(`[wm] ${ctx.display_id} → review lease=${currentLease}`);
+}
+
+async function loadTaskContext(
+  ds: DataSource,
+  taskId: string,
+): Promise<TaskContext | null> {
+  const rows = (await ds.query(
+    `
+    SELECT
+      at.id            AS task_id,
+      at.display_id,
+      at.module,
+      at.project_id,
+      p.slug           AS project_slug,
+      p.github_owner,
+      p.github_repo,
+      p.github_default_branch AS default_branch,
+      r.id             AS report_id,
+      r.title          AS report_title,
+      r.description    AS report_body
+    FROM public.agent_tasks at
+    JOIN public.projects p ON p.id = at.project_id
+    JOIN public.reports  r ON r.id = at.report_id
+    WHERE at.id = $1
+    LIMIT 1
+    `,
+    [taskId],
+  )) as Array<TaskContext>;
+  return rows[0] ?? null;
+}
+
+async function failTask(
+  ds: DataSource,
+  taskId: string,
+  expectedLease: number,
+  reason: string,
+): Promise<void> {
+  try {
+    await ds.query(
+      `
+      SELECT public.fence_and_transition(
+        $1, $2::bigint, 'in_progress'::public.task_status_enum,
+        'failed'::public.task_status_enum,
+        $3::varchar(128), 'system'::public.actor_kind_enum,
+        jsonb_build_object('reason', $4::text),
+        $3::varchar(128)
+      )
+      `,
+      [taskId, expectedLease, WORKER_ID, reason.slice(0, 1000)],
+    );
+  } catch (err) {
+    console.error(`[wm] failTask ${taskId} also failed:`, err);
+  }
 }
 
 function sleep(ms: number): Promise<void> {
