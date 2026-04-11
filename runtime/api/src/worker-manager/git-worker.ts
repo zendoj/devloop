@@ -40,6 +40,7 @@ import { existsSync } from 'node:fs';
  */
 
 const WORKTREES_BASE = '/var/lib/devloop/worktrees';
+const CONTEXTS_BASE = '/var/lib/devloop/contexts';
 const CLAUDE_BIN = '/var/lib/devloop/bin/claude';
 const CLAUDE_HOME = '/var/lib/devloop/claude-home';
 const CLAUDE_TIMEOUT_MS = 15 * 60 * 1000;
@@ -156,23 +157,27 @@ esac
     // Branch off the default branch.
     await runGit(['checkout', '-b', branchName], workDir, safeToken, askpassEnv);
 
-    // Fas H: write planner output + accumulated human-reject
-    // feedback into the worktree as .devloop/plan.md + files
-    // under .devloop/feedback/attempt-N/. Claude reads them via
-    // --add-dir and uses them as extra context without needing
-    // another tool invocation.
-    const devloopDir = `${workDir}/.devloop`;
-    await mkdir(devloopDir, { recursive: true });
+    // Fas H+I: write planner output, human-reject feedback, and
+    // rich-report attachments into a SIBLING directory OUTSIDE
+    // the worktree. Earlier versions used ${workDir}/.devloop
+    // but that collides with repos that already have a committed
+    // .devloop/ directory — when the worker later cleaned up
+    // the directory the deletions got staged as part of the
+    // task's commit and the reviewer rightly rejected it as a
+    // scope violation. Context lives in /var/lib/devloop/contexts/
+    // instead, and we pass it to Claude via --add-dir.
+    const contextDir = `${CONTEXTS_BASE}/${input.taskId}`;
+    await mkdir(contextDir, { recursive: true });
     if (input.plan && input.plan.length > 0) {
-      await writeFile(`${devloopDir}/plan.md`, input.plan, 'utf8');
+      await writeFile(`${contextDir}/plan.md`, input.plan, 'utf8');
     }
     await writeFile(
-      `${devloopDir}/report.md`,
+      `${contextDir}/report.md`,
       `# ${input.reportTitle}\n\n${input.reportBody}\n`,
       'utf8',
     );
     for (const fb of input.feedback) {
-      const attemptDir = `${devloopDir}/feedback/attempt-${fb.attempt_number}`;
+      const attemptDir = `${contextDir}/feedback/attempt-${fb.attempt_number}`;
       await mkdir(attemptDir, { recursive: true });
       await writeFile(
         `${attemptDir}/feedback.md`,
@@ -180,19 +185,12 @@ esac
         'utf8',
       );
       for (const f of fb.files) {
-        // Files are stored base64-encoded in the DB (per
-        // tasks.controller reject handler). Decode on the way
-        // out so Claude sees real bytes.
         const bytes = Buffer.from(f.content, 'base64');
         await writeFile(`${attemptDir}/${f.name}`, bytes);
       }
     }
-
-    // Fas I: rich-report attachments (screenshot, console log,
-    // network log, state dump, element selector). Dropped into
-    // .devloop/attachments/ so Claude can open them directly.
     if (input.attachments.length > 0) {
-      const attachDir = `${devloopDir}/attachments`;
+      const attachDir = `${contextDir}/attachments`;
       await mkdir(attachDir, { recursive: true });
       for (const a of input.attachments) {
         const bytes = Buffer.from(a.content_base64, 'base64');
@@ -207,21 +205,17 @@ esac
     const sanitizedTitle = input.reportTitle.replace(/[\r\n]/g, ' ').slice(0, 200);
     const claudeResult = await runClaude(
       workDir,
+      contextDir,
       sanitizedTitle,
       input.reportBody,
       input.plan,
       input.feedback.length > 0,
       input.attachments.length > 0,
     );
-
-    // Before staging, strip .devloop/ out of the worktree — it's
-    // scratch context for Claude, not part of the commit. rm -rf
-    // is bounded to a hardcoded subdir of the worktree.
-    try {
-      await rm(devloopDir, { recursive: true, force: true });
-    } catch {
-      /* non-fatal */
-    }
+    // contextDir is cleaned up in the finally block at the
+    // bottom of this function, alongside the worktree and
+    // askpass helper. Nothing in it ever reaches the worktree,
+    // so there's no pre-git-add cleanup to do.
 
     // Detect whether Claude actually changed anything. An empty
     // worktree status means Claude produced no fix and the task
@@ -269,7 +263,18 @@ esac
 
     // Push the branch. The askpass helper provides credentials
     // when git prompts; the token never appears in argv.
-    await runGit(['push', 'origin', branchName], workDir, safeToken, askpassEnv);
+    // --force: DevLoop owns the devloop/task/* namespace and the
+    // branch name is derived from the task's display_id. If the
+    // DB was wiped and a fresh T-1 re-uses the same branch name,
+    // the old GitHub branch from a prior run still exists and
+    // a vanilla push would be rejected. Force-push is safe here
+    // because nothing else ever touches these branches.
+    await runGit(
+      ['push', '--force', 'origin', branchName],
+      workDir,
+      safeToken,
+      askpassEnv,
+    );
 
     return {
       branch_name: branchName,
@@ -279,10 +284,10 @@ esac
       summary: claudeResult.summary.slice(0, 500) || commitSubject,
     };
   } finally {
-    // Always clean up the worktree AND the askpass helper dir so
-    // the next task run starts fresh and the token file is not
-    // left on disk. Both paths are validated against the
-    // hardcoded prefix before rm.
+    // Always clean up the worktree, the askpass helper dir, AND
+    // the context dir so the next task run starts fresh and no
+    // token/credentials/attachments are left on disk. Every path
+    // is validated against a hardcoded prefix before rm.
     if (workDir.startsWith(`${WORKTREES_BASE}/`) && existsSync(workDir)) {
       await rm(workDir, { recursive: true, force: true });
     }
@@ -291,6 +296,10 @@ esac
       existsSync(askpassDir)
     ) {
       await rm(askpassDir, { recursive: true, force: true });
+    }
+    const contextDir = `${CONTEXTS_BASE}/${input.taskId}`;
+    if (contextDir.startsWith(`${CONTEXTS_BASE}/`) && existsSync(contextDir)) {
+      await rm(contextDir, { recursive: true, force: true });
     }
   }
 }
@@ -366,6 +375,7 @@ interface ClaudeResult {
  */
 async function runClaude(
   worktree: string,
+  contextDir: string,
   title: string,
   body: string,
   plan: string | null,
@@ -377,18 +387,22 @@ async function runClaude(
     'a fresh git worktree. Your job: read the bug report below and',
     'make the smallest possible code change to fix it.',
     '',
-    'Context files in .devloop/ (read-only for you, NOT part of the commit):',
-    '  .devloop/report.md — the original bug report',
+    `The project source is at: ${worktree}`,
+    `Read-only context files are at: ${contextDir}`,
+    '',
+    'Context files (do NOT edit these — they are in a separate',
+    'directory outside the git worktree and exist only to brief you):',
+    `  ${contextDir}/report.md — the original bug report`,
   ];
   if (plan && plan.length > 0) {
     systemPromptLines.push(
-      '  .devloop/plan.md   — the planner\'s strategy. Follow it',
+      `  ${contextDir}/plan.md   — the planner's strategy. Follow it`,
       '                        unless you see it is wrong.',
     );
   }
   if (hasPriorFeedback) {
     systemPromptLines.push(
-      '  .devloop/feedback/attempt-N/ — previous human rejections.',
+      `  ${contextDir}/feedback/attempt-N/ — previous human rejections.`,
       '                        Read every attempt-N/feedback.md and any',
       '                        attached screenshots/logs. Address',
       '                        each concern before making your fix.',
@@ -396,7 +410,7 @@ async function runClaude(
   }
   if (hasAttachments) {
     systemPromptLines.push(
-      '  .devloop/attachments/ — rich bug-report artifacts:',
+      `  ${contextDir}/attachments/ — rich bug-report artifacts:`,
       '                        screenshot.png, console.log,',
       '                        network.log, state.json, element.json.',
       '                        Read them to understand EXACTLY what',
@@ -406,13 +420,13 @@ async function runClaude(
   systemPromptLines.push(
     '',
     'Hard rules:',
+    '- Edit ONLY files inside the git worktree. Do NOT touch anything',
+    `  under ${contextDir} — that is read-only context.`,
     '- Do NOT refactor unrelated code.',
     '- Do NOT add comments beyond what is strictly necessary.',
     '- Do NOT create new files unless the fix absolutely requires it.',
     '- Do NOT run destructive shell commands.',
     '- Do NOT commit or push — the worker handles git.',
-    '- Do NOT modify anything inside .devloop/ — that directory is',
-    '  stripped before commit and is context only.',
     '- If you cannot determine a safe fix, edit nothing and explain',
     '  why in your final message; the worker will fail the task.',
     '',
@@ -428,10 +442,10 @@ async function runClaude(
       '## Planner output',
       '',
       'The Planner agent produced this strategy before you were',
-      'invoked. You can read it in full at .devloop/plan.md. It',
-      'is a recommendation, not a command — you have the actual',
-      'code open and can deviate if you see something the',
-      'planner missed.',
+      `invoked. You can read it in full at ${contextDir}/plan.md.`,
+      'It is a recommendation, not a command — you have the',
+      'actual code open and can deviate if you see something',
+      'the planner missed.',
       '',
       plan.slice(0, 4000),
     );
@@ -445,8 +459,8 @@ async function runClaude(
       'version of your work was deployed and a human rejected it',
       'because it did not actually fix the reported problem when',
       'tried in the running product. Read every file under',
-      '.devloop/feedback/ and make sure your new attempt addresses',
-      'each issue raised.',
+      `${contextDir}/feedback/ and make sure your new attempt`,
+      'addresses each issue raised.',
     );
   }
   if (hasAttachments) {
@@ -455,12 +469,13 @@ async function runClaude(
       '## Rich bug-report attachments',
       '',
       'The bug reporter captured runtime state when they filed',
-      'this report. Look in .devloop/attachments/ — there may be',
-      'a screenshot showing the broken state, a console.log with',
-      'the JS errors that happened right before the report, a',
-      'network.log with failed HTTP requests, and a state.json',
-      'with the client app state at the time. Use these to',
-      'pinpoint the exact root cause before you start editing.',
+      `this report. Look in ${contextDir}/attachments/ — there`,
+      'may be a screenshot showing the broken state, a',
+      'console.log with the JS errors that happened right before',
+      'the report, a network.log with failed HTTP requests, and',
+      'a state.json with the client app state at the time. Use',
+      'these to pinpoint the exact root cause before you start',
+      'editing.',
     );
   }
   const userPrompt = userPromptParts.join('\n');
@@ -478,6 +493,8 @@ async function runClaude(
     CLAUDE_ALLOWED_TOOLS,
     '--add-dir',
     worktree,
+    '--add-dir',
+    contextDir,
     '--max-budget-usd',
     CLAUDE_MAX_BUDGET_USD,
     '--no-session-persistence',
@@ -493,6 +510,12 @@ async function runClaude(
         HOME: CLAUDE_HOME,
         CLAUDE_NONINTERACTIVE: '1',
       },
+      // Explicitly close stdin so Claude 2.1+ does not wait 3s
+      // for piped prompt data when we've already passed the
+      // prompt as an argv (-p <prompt>). Without this, the CLI
+      // emits 'no stdin data received in 3s, proceeding without
+      // it' and then exits 1 before completing the run.
+      stdio: ['ignore', 'pipe', 'pipe'],
     });
     let stdout = '';
     let stderr = '';

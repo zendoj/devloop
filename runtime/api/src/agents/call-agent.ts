@@ -480,9 +480,16 @@ async function callOpenai(
 }
 
 function sleep(ms: number): Promise<void> {
+  // Do NOT unref() this timer. The webengine throttle + job-poll
+  // loops are the ONLY pending work during a summarizer call
+  // from the deployer — if the timer is unref'd, Node sees zero
+  // active handles and cleanly exits the whole process with
+  // code 0 while the await is still pending. That manifests as
+  // the deployer silently dropping out mid-deploy. Standard
+  // (ref'd) setTimeout keeps the loop alive until the sleep
+  // resolves and the next real work lands.
   return new Promise((res) => {
-    const t = setTimeout(res, ms);
-    t.unref();
+    setTimeout(res, ms);
   });
 }
 

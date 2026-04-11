@@ -139,6 +139,22 @@ interface RollingBackTask {
 }
 
 async function main(): Promise<void> {
+  // Debug: surface any silent exit so we see WHY the process is
+  // leaving. Added after a bug where the deployer was exiting
+  // with code 0 halfway through deployOne without logging anything.
+  process.on('exit', (code) => {
+    console.log(`[dp] process.exit code=${code}`);
+  });
+  process.on('uncaughtException', (err) => {
+    console.error('[dp] uncaughtException:', err);
+  });
+  process.on('unhandledRejection', (reason) => {
+    console.error('[dp] unhandledRejection:', reason);
+  });
+  process.on('beforeExit', (code) => {
+    console.log(`[dp] beforeExit code=${code}`);
+  });
+
   console.log(`[dp] starting deployer ${DEPLOYER_ID}`);
   if (ACTIVE_KEY_ID.length === 0 || SIGNING_KEY === null) {
     console.error(
