@@ -12,14 +12,17 @@ import type { NextRequest } from 'next/server';
 export function middleware(req: NextRequest): NextResponse {
   const { pathname } = req.nextUrl;
 
-  // Allow the login page + any /auth/* passthrough (Nginx handles
-  // /auth routing, but keep the allow list explicit). The exact-match
-  // '/auth' + prefix '/auth/' shape is deliberate — a loose
-  // startsWith('/auth') would also match '/author' or '/authz'.
+  // Allow the login page + any /auth/* + /api/* passthrough (Nginx
+  // handles /auth and /api routing to the backend, but keep the
+  // allow list explicit). The exact-match '/auth' + prefix '/auth/'
+  // shape is deliberate — a loose startsWith('/auth') would also
+  // match '/author' or '/authz'.
   if (
     pathname === '/login' ||
     pathname === '/auth' ||
     pathname.startsWith('/auth/') ||
+    pathname === '/api' ||
+    pathname.startsWith('/api/') ||
     pathname.startsWith('/_next/') ||
     pathname === '/favicon.ico'
   ) {
