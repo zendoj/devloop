@@ -78,6 +78,11 @@ const SIGNING_PRIV_PEM =
     ? loadFile(`deploy_signing_priv_${ACTIVE_KEY_ID}`)
     : null;
 
+// GitHub token for PR creation/merge. Same file the worker
+// manager uses. Reading empty as null so the deployer fails
+// fast at startup if the operator forgot to provision it.
+const GITHUB_TOKEN = (loadFile('github_token') ?? '').trim();
+
 let SIGNING_KEY: ReturnType<typeof createPrivateKey> | null = null;
 if (SIGNING_PRIV_PEM !== null) {
   SIGNING_KEY = createPrivateKey({ key: SIGNING_PRIV_PEM, format: 'pem' });
@@ -93,6 +98,14 @@ interface ApprovedTask {
   base_sha: string;
   head_sha: string;
   default_branch: string;
+  github_owner: string;
+  github_repo: string;
+  report_title: string;
+}
+
+interface PrResult {
+  pr_number: number;
+  merge_sha: string;
 }
 
 interface VerifyingTask {
@@ -153,9 +166,13 @@ async function deployApproved(ds: DataSource): Promise<void> {
       at.branch_name,
       at.approved_base_sha AS base_sha,
       at.approved_head_sha AS head_sha,
-      p.github_default_branch AS default_branch
+      p.github_default_branch AS default_branch,
+      p.github_owner,
+      p.github_repo,
+      r.title AS report_title
     FROM public.agent_tasks at
     JOIN public.projects p ON p.id = at.project_id
+    JOIN public.reports  r ON r.id = at.report_id
     WHERE at.status = 'approved'
     ORDER BY at.created_at ASC
     LIMIT $1
@@ -178,12 +195,33 @@ async function deployOne(ds: DataSource, t: ApprovedTask): Promise<void> {
     `[dp] ${t.display_id} deploying ${t.branch_name} head=${t.head_sha.slice(0, 7)}`,
   );
 
+  // Step -1: create + merge the GitHub PR BEFORE starting the
+  // DB transaction. A PR creation or merge failure leaves the
+  // task in 'approved' (untouched DB state) so the next
+  // iteration retries cleanly. Doing this inside the txn would
+  // hold the deploy_mutex across an external HTTP call, which
+  // is worse under contention.
+  let prResult: PrResult;
+  try {
+    prResult = await createAndMergePr(t);
+  } catch (err) {
+    console.error(`[dp] ${t.display_id} PR step failed:`, err);
+    // Leave task in 'approved' — next iteration retries. If
+    // the failure is permanent (e.g. branch already merged),
+    // operators need to cancel the task manually for now.
+    // A proper permanent/transient split is a Fas 6+ concern.
+    return;
+  }
+  console.log(
+    `[dp] ${t.display_id} PR #${prResult.pr_number} merged as ${prResult.merge_sha.slice(0, 7)}`,
+  );
+
   // Step 0: build + sign desired_state OUTSIDE the transaction.
   // The signature is deterministic given the inputs and is
   // pure compute, so doing it before the transaction shortens
   // the lock window on agent_tasks/deploy_mutex inside the txn.
   const issuedAt = new Date().toISOString();
-  const mergedSha = t.head_sha;
+  const mergedSha = prResult.merge_sha;
   const desired = {
     project_id: t.project_id,
     deploy_sha: mergedSha,
@@ -221,18 +259,23 @@ async function deployOne(ds: DataSource, t: ApprovedTask): Promise<void> {
     )) as Array<{ new_lease: string | number }>;
     let currentLease = Number(r1[0]?.new_lease ?? t.lease_version);
 
-    // Step 2: deploying → merged.
+    // Step 2: deploying → merged. Also stamp github_pr_number so
+    // the UI can link back to the GitHub PR that was
+    // auto-merged.
     const r2 = (await m.query(
       `
       SELECT public.fence_and_transition(
         $1, $2::bigint, 'deploying'::public.task_status_enum,
         'merged'::public.task_status_enum,
         $3::varchar(128), 'system'::public.actor_kind_enum,
-        jsonb_build_object('merged_commit_sha', $4::text),
+        jsonb_build_object(
+          'merged_commit_sha', $4::text,
+          'github_pr_number',  $5::int
+        ),
         $3::varchar(128)
       ) AS new_lease
       `,
-      [t.task_id, currentLease, DEPLOYER_ID, mergedSha],
+      [t.task_id, currentLease, DEPLOYER_ID, mergedSha, prResult.pr_number],
     )) as Array<{ new_lease: string | number }>;
     currentLease = Number(r2[0]?.new_lease ?? currentLease);
 
@@ -337,6 +380,117 @@ async function verifyVerifying(ds: DataSource): Promise<void> {
       console.error(`[dp] ${t.display_id} verify transition failed:`, err);
     }
   }
+}
+
+/**
+ * Create a GitHub PR for the worker's branch and immediately
+ * merge it (squash). Returns the real merge_commit_sha so the
+ * deployer can use it as the deploy_sha for the signed
+ * desired_state. The reviewer (Fas 4) has already gpt-5.4-
+ * approved the diff before the task hit 'approved', so the
+ * auto-merge is gated on that.
+ *
+ * Raises on any GitHub API failure. The caller leaves the task
+ * in 'approved' on failure so a retry is clean.
+ *
+ * Note: a real production deploy pipeline would additionally
+ * wait for CI + branch protection checks. This function
+ * depends on branch protection being configured separately on
+ * the repo — if GitHub refuses to merge because required
+ * checks are missing, the merge call returns 405/422 and we
+ * throw.
+ */
+async function createAndMergePr(t: ApprovedTask): Promise<PrResult> {
+  if (GITHUB_TOKEN.length === 0) {
+    throw new Error('github_token not loaded');
+  }
+  const headers: Record<string, string> = {
+    'Accept': 'application/vnd.github+json',
+    'Authorization': `Bearer ${GITHUB_TOKEN}`,
+    'User-Agent': 'devloop-deployer/1.0',
+    'X-GitHub-Api-Version': '2022-11-28',
+    'Content-Type': 'application/json',
+  };
+
+  const repo = `${t.github_owner}/${t.github_repo}`;
+
+  // Step 1: create the PR. If a PR already exists for this
+  // branch (e.g. a previous retry), GitHub returns 422 with
+  // a specific error message; we then look up the existing PR.
+  const createBody = {
+    title: `devloop(${t.display_id}): ${t.report_title}`.slice(0, 250),
+    body: [
+      `DevLoop task: ${t.display_id}`,
+      `Module: ${t.module}`,
+      `Base SHA: ${t.base_sha}`,
+      `Head SHA: ${t.head_sha}`,
+      '',
+      'This PR was opened automatically by the DevLoop deployer',
+      'after gpt-5.4 reasoning=medium reviewed the diff and',
+      'marked the task approved.',
+    ].join('\n'),
+    head: t.branch_name,
+    base: t.default_branch,
+    maintainer_can_modify: false,
+  };
+
+  const createUrl = `https://api.github.com/repos/${t.github_owner}/${t.github_repo}/pulls`;
+  const createRes = await fetch(createUrl, {
+    method: 'POST',
+    headers,
+    body: JSON.stringify(createBody),
+  });
+
+  let prNumber: number;
+  if (createRes.status === 201) {
+    const created = (await createRes.json()) as { number: number };
+    prNumber = created.number;
+    console.log(`[dp] ${t.display_id} opened PR #${prNumber} on ${repo}`);
+  } else if (createRes.status === 422) {
+    // Either the PR already exists, or the base/head is invalid.
+    // Probe for an existing open PR for this branch.
+    const existingUrl = `https://api.github.com/repos/${t.github_owner}/${t.github_repo}/pulls?head=${encodeURIComponent(`${t.github_owner}:${t.branch_name}`)}&state=open`;
+    const existingRes = await fetch(existingUrl, { method: 'GET', headers });
+    if (!existingRes.ok) {
+      const err = await createRes.text().catch(() => '');
+      throw new Error(`PR create 422 and existing-PR probe failed: ${err.slice(0, 200)}`);
+    }
+    const existing = (await existingRes.json()) as Array<{ number: number }>;
+    if (existing.length === 0) {
+      const err = await createRes.text().catch(() => '');
+      throw new Error(`PR create 422 (no existing PR found): ${err.slice(0, 300)}`);
+    }
+    prNumber = existing[0]!.number;
+    console.log(`[dp] ${t.display_id} reusing existing PR #${prNumber} on ${repo}`);
+  } else {
+    const err = await createRes.text().catch(() => '');
+    throw new Error(`PR create HTTP ${createRes.status}: ${err.slice(0, 300)}`);
+  }
+
+  // Step 2: squash merge the PR.
+  const mergeUrl = `https://api.github.com/repos/${t.github_owner}/${t.github_repo}/pulls/${prNumber}/merge`;
+  const mergeBody = {
+    merge_method: 'squash',
+    commit_title: `devloop(${t.display_id}): ${t.report_title}`.slice(0, 250),
+    commit_message: [
+      `DevLoop task: ${t.display_id}`,
+      `Auto-merged by devloop-deployer after gpt-5.4 review.`,
+    ].join('\n'),
+  };
+  const mergeRes = await fetch(mergeUrl, {
+    method: 'PUT',
+    headers,
+    body: JSON.stringify(mergeBody),
+  });
+  if (!mergeRes.ok) {
+    const err = await mergeRes.text().catch(() => '');
+    throw new Error(`PR merge HTTP ${mergeRes.status}: ${err.slice(0, 300)}`);
+  }
+  const merged = (await mergeRes.json()) as { sha: string; merged: boolean };
+  if (merged.merged !== true || typeof merged.sha !== 'string' || merged.sha.length < 7) {
+    throw new Error(`PR merge unexpected response: ${JSON.stringify(merged).slice(0, 200)}`);
+  }
+  return { pr_number: prNumber, merge_sha: merged.sha };
 }
 
 function sleep(ms: number): Promise<void> {
