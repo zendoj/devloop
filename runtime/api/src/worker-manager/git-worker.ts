@@ -1,24 +1,27 @@
 /* eslint-disable no-console */
 import { spawn } from 'node:child_process';
-import { mkdir, rm, writeFile, readFile, chmod } from 'node:fs/promises';
+import { mkdir, rm, writeFile, chmod } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
 
 /**
- * Fas 3 worker runtime — real git operations.
+ * Fas B1 worker runtime — real git + Claude CLI.
  *
  * Given a project + task context, this module:
  *   1. Clones the project's GitHub repo into a per-task worktree
- *      under /var/lib/devloop/worktrees/<task_id> via the
- *      credentialed remote `https://x-access-token:<token>@…`.
- *   2. Checks out the default branch.
- *   3. Creates a `devloop/task/<display_id>` branch.
- *   4. Makes a trivial marker change (appends a DEVLOOP task note
- *      to DEVLOOP_TASKS.md — new file if missing). Real Claude
- *      invocation replaces this in Fas 3b+.
- *   5. git commit + git push origin <branch>.
- *   6. Cleans up the worktree directory.
- *   7. Returns the branch name + head SHA so the Worker Manager
- *      can record it in agent_tasks.
+ *      under /var/lib/devloop/worktrees/<task_id>.
+ *   2. Checks out the default branch and creates
+ *      `devloop/task/<display_id>`.
+ *   3. Spawns the Claude CLI (`/var/lib/devloop/bin/claude -p`)
+ *      inside the worktree with the report title + body as the
+ *      user prompt and a system prompt that constrains it to
+ *      minimal code changes. Claude is given Read/Edit/Write and
+ *      a narrow Bash allowlist, runs with bypassPermissions, and
+ *      is capped by --max-budget-usd.
+ *   4. Commits whatever Claude changed on the worktree head and
+ *      pushes the branch.
+ *   5. Cleans up the worktree.
+ *   6. Returns branch + head SHA + a summary extracted from
+ *      Claude's JSON output so the Worker Manager can record it.
  *
  * Security invariants:
  *   - The token never leaks into logs. git command output is
@@ -37,6 +40,12 @@ import { existsSync } from 'node:fs';
  */
 
 const WORKTREES_BASE = '/var/lib/devloop/worktrees';
+const CLAUDE_BIN = '/var/lib/devloop/bin/claude';
+const CLAUDE_HOME = '/var/lib/devloop/claude-home';
+const CLAUDE_TIMEOUT_MS = 15 * 60 * 1000;
+const CLAUDE_MAX_BUDGET_USD = '5';
+const CLAUDE_ALLOWED_TOOLS =
+  'Read Edit Write Glob Grep Bash(git:status,git:diff,git:log,ls,cat,rg,grep,find,node,npm:run,npx:tsc)';
 
 export interface WorkerRunInput {
   taskId: string;
@@ -131,47 +140,56 @@ esac
     // Branch off the default branch.
     await runGit(['checkout', '-b', branchName], workDir, safeToken, askpassEnv);
 
-    // Trivial "fix": append a marker note to DEVLOOP_TASKS.md. This
-    // is the Fas 3 stub — real Claude invocation ships in Fas 3b.
-    // The file is intentionally non-code so the reviewer can see
-    // the shape of the flow without a real code change breaking
-    // the repo.
-    const notePath = `${workDir}/DEVLOOP_TASKS.md`;
-    let priorNote = '';
-    try {
-      priorNote = await readFile(notePath, 'utf8');
-    } catch {
-      priorNote = '# DevLoop task notes\n\n';
-    }
+    // Hand the task to Claude. It runs inside workDir with Read/
+    // Edit/Write + a narrow Bash allowlist and is capped by a USD
+    // budget. If Claude errors or makes no file changes we fail
+    // the task — the caller transitions to 'failed'.
     const sanitizedTitle = input.reportTitle.replace(/[\r\n]/g, ' ').slice(0, 200);
-    const sanitizedBody = input.reportBody.replace(/[\r\n]+/g, '\n').slice(0, 2000);
-    const appendedNote = `## ${input.displayId} — ${sanitizedTitle}
+    const claudeResult = await runClaude(workDir, sanitizedTitle, input.reportBody);
 
-**Status:** stub analysis from worker runtime Fas 3a.
+    // Detect whether Claude actually changed anything. An empty
+    // worktree status means Claude produced no fix and the task
+    // must not be pushed as a no-op.
+    const statusOut = await runGit(
+      ['status', '--porcelain'],
+      workDir,
+      safeToken,
+      askpassEnv,
+    );
+    if (statusOut.trim().length === 0) {
+      throw new Error(
+        `claude produced no file changes (cost=$${claudeResult.costUsd.toFixed(4)}, turns=${claudeResult.numTurns})`,
+      );
+    }
 
-${sanitizedBody}
+    // Collect the list of touched files for the result payload.
+    const filesChanged = statusOut
+      .split('\n')
+      .map((l) => l.trim())
+      .filter((l) => l.length > 0)
+      .map((l) => l.slice(3));
 
-_This placeholder note was added by DevLoop Worker stub. Fas 3b wires in Claude for a real fix._
-`;
-    await writeFile(notePath, priorNote + '\n' + appendedNote, 'utf8');
-
-    // Stage + commit.
-    await runGit(['add', 'DEVLOOP_TASKS.md'], workDir, safeToken);
-    const commitSubject = `devloop(${input.displayId}): stub fix for ${sanitizedTitle}`;
+    // Stage + commit everything Claude touched.
+    await runGit(['add', '-A'], workDir, safeToken, askpassEnv);
+    const commitSubject = `devloop(${input.displayId}): ${sanitizedTitle}`.slice(0, 120);
+    const commitBody = [
+      `DevLoop task: ${input.taskId}`,
+      `Worker: ${input.workerId}`,
+      `Claude session: ${claudeResult.sessionId}`,
+      `Claude cost: $${claudeResult.costUsd.toFixed(4)} (${claudeResult.numTurns} turns)`,
+      '',
+      claudeResult.summary.slice(0, 2000),
+    ].join('\n');
     await runGit(
-      [
-        'commit',
-        '-m',
-        commitSubject,
-        '-m',
-        `DevLoop task: ${input.taskId}\nWorker: ${input.workerId}\nStub-only: no real code change. See DEVLOOP_TASKS.md for the task note.`,
-      ],
+      ['commit', '-m', commitSubject, '-m', commitBody],
       workDir,
       safeToken,
       askpassEnv,
     );
 
-    const headSha = (await runGit(['rev-parse', 'HEAD'], workDir, safeToken, askpassEnv)).trim();
+    const headSha = (
+      await runGit(['rev-parse', 'HEAD'], workDir, safeToken, askpassEnv)
+    ).trim();
 
     // Push the branch. The askpass helper provides credentials
     // when git prompts; the token never appears in argv.
@@ -181,8 +199,8 @@ _This placeholder note was added by DevLoop Worker stub. Fas 3b wires in Claude 
       branch_name: branchName,
       base_sha: baseSha,
       head_sha: headSha,
-      files_changed: ['DEVLOOP_TASKS.md'],
-      summary: commitSubject,
+      files_changed: filesChanged,
+      summary: claudeResult.summary.slice(0, 500) || commitSubject,
     };
   } finally {
     // Always clean up the worktree AND the askpass helper dir so
@@ -252,4 +270,134 @@ async function runGit(
 function redactToken(s: string, token: string): string {
   if (!token || token.length < 8) return s;
   return s.split(token).join('REDACTED');
+}
+
+interface ClaudeResult {
+  sessionId: string;
+  costUsd: number;
+  numTurns: number;
+  summary: string;
+}
+
+/**
+ * Spawn the Claude CLI inside the given worktree and wait for it
+ * to finish. The CLI runs non-interactively (`-p`) with JSON
+ * output, bypassPermissions (edits without prompting), a narrow
+ * tool allowlist, and a USD budget cap. HOME is redirected to
+ * /var/lib/devloop/claude-home so Claude reads devloop-api's
+ * credentials rather than /home/jonas (which is hidden by
+ * ProtectHome in the systemd unit).
+ */
+async function runClaude(
+  worktree: string,
+  title: string,
+  body: string,
+): Promise<ClaudeResult> {
+  const systemPrompt = [
+    'You are DevLoop Worker, an autonomous bug-fixer running inside',
+    'a fresh git worktree. Your job: read the bug report below and',
+    'make the smallest possible code change to fix it.',
+    '',
+    'Hard rules:',
+    '- Do NOT refactor unrelated code.',
+    '- Do NOT add comments beyond what is strictly necessary.',
+    '- Do NOT create new files unless the fix absolutely requires it.',
+    '- Do NOT run destructive shell commands.',
+    '- Do NOT commit or push — the worker handles git.',
+    '- If you cannot determine a safe fix, edit nothing and explain',
+    '  why in your final message; the worker will fail the task.',
+    '',
+    'When you are done editing, end your final message with a short',
+    'one-paragraph summary of what you changed and why.',
+  ].join('\n');
+
+  const userPrompt = `# Bug report: ${title}\n\n${body}`;
+
+  const args = [
+    '-p',
+    userPrompt,
+    '--output-format',
+    'json',
+    '--append-system-prompt',
+    systemPrompt,
+    '--permission-mode',
+    'bypassPermissions',
+    '--allowedTools',
+    CLAUDE_ALLOWED_TOOLS,
+    '--add-dir',
+    worktree,
+    '--max-budget-usd',
+    CLAUDE_MAX_BUDGET_USD,
+    '--no-session-persistence',
+  ];
+
+  console.log(`[worker] spawning claude in ${worktree}`);
+
+  return new Promise((resolve, reject) => {
+    const proc = spawn(CLAUDE_BIN, args, {
+      cwd: worktree,
+      env: {
+        PATH: '/var/lib/devloop/bin:/usr/bin:/bin',
+        HOME: CLAUDE_HOME,
+        CLAUDE_NONINTERACTIVE: '1',
+      },
+    });
+    let stdout = '';
+    let stderr = '';
+    proc.stdout.on('data', (chunk: Buffer) => {
+      stdout += chunk.toString('utf8');
+    });
+    proc.stderr.on('data', (chunk: Buffer) => {
+      stderr += chunk.toString('utf8');
+    });
+    const timer = setTimeout(() => {
+      proc.kill('SIGKILL');
+      reject(new Error(`claude timed out after ${CLAUDE_TIMEOUT_MS}ms`));
+    }, CLAUDE_TIMEOUT_MS);
+    proc.on('error', (err) => {
+      clearTimeout(timer);
+      reject(err);
+    });
+    proc.on('close', (code) => {
+      clearTimeout(timer);
+      if (code !== 0) {
+        reject(
+          new Error(
+            `claude exited ${code}: ${stderr.slice(-500) || stdout.slice(-500)}`,
+          ),
+        );
+        return;
+      }
+      try {
+        const parsed = JSON.parse(stdout) as {
+          is_error?: boolean;
+          result?: string;
+          session_id?: string;
+          total_cost_usd?: number;
+          num_turns?: number;
+          subtype?: string;
+        };
+        if (parsed.is_error) {
+          reject(
+            new Error(
+              `claude reported error (${parsed.subtype ?? 'unknown'}): ${(parsed.result ?? '').slice(0, 500)}`,
+            ),
+          );
+          return;
+        }
+        resolve({
+          sessionId: parsed.session_id ?? 'unknown',
+          costUsd: parsed.total_cost_usd ?? 0,
+          numTurns: parsed.num_turns ?? 0,
+          summary: parsed.result ?? '',
+        });
+      } catch (e) {
+        reject(
+          new Error(
+            `claude output was not valid JSON: ${(e as Error).message}; first 200 bytes: ${stdout.slice(0, 200)}`,
+          ),
+        );
+      }
+    });
+  });
 }
