@@ -4,6 +4,7 @@ import { randomUUID } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import { DataSource } from 'typeorm';
 import { buildDataSource } from '../data-source';
+import { planForTaskDirect } from '../orchestrator/planner.service';
 import { runWorkerStub, WorkerRunResult } from './git-worker';
 
 /**
@@ -269,11 +270,38 @@ async function processOne(
 
   // Step 2: load the full task context (project repo, report
   // body) needed by the worker runtime.
-  const ctx = await loadTaskContext(ds, taskId);
+  let ctx = await loadTaskContext(ds, taskId);
   if (!ctx) {
     console.warn(`[wm] ${taskId} context lookup failed — failing task`);
     await failTask(ds, taskId, currentLease, 'context lookup failed');
     return;
+  }
+
+  // Step 2b: run the planner here (not at report intake time).
+  // Running the planner in the intake path would block the HTTP
+  // response for 60-90 seconds and trip Cloudflare's 100s timeout
+  // (HTTP 524). Doing it right before Claude spawns keeps the
+  // intake fast and the plan fresh (the task may have been in
+  // the queue for a while). Best-effort: if the planner fails,
+  // proceeds without a plan — Claude plans internally anyway.
+  if (!ctx.plan) {
+    try {
+      const plan = await planForTaskDirect(
+        ds,
+        taskId,
+        ctx.report_title,
+        ctx.report_body,
+        ctx.module,
+        'standard',
+      );
+      if (plan) {
+        ctx = { ...ctx, plan };
+      }
+    } catch (err) {
+      console.warn(
+        `[wm] ${ctx.display_id} planner call failed (non-fatal): ${(err as Error).message}`,
+      );
+    }
   }
 
   // Step 3: actually run the worker. If the GitHub token is
