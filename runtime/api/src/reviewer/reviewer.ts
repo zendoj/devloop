@@ -96,6 +96,7 @@ interface TaskForReview {
   report_title: string;
   report_body: string;
   files_changed: unknown;
+  plan: string | null;
 }
 
 interface ReviewVerdict {
@@ -159,7 +160,8 @@ async function runOnce(ds: DataSource): Promise<void> {
       p.github_repo,
       r.title          AS report_title,
       r.description    AS report_body,
-      at.files_changed
+      at.files_changed,
+      at.plan
     FROM public.agent_tasks at
     JOIN public.projects p ON p.id = at.project_id
     JOIN public.reports  r ON r.id = at.report_id
@@ -262,15 +264,21 @@ async function reviewOneClaimed(
       ? diff.slice(0, MAX_DIFF_BYTES) + `\n\n…(truncated, original ${diff.length} bytes)`
       : diff;
 
-  // Step 2: ask the reviewer agent (provider + model from
-  // agent_configs). The callAgent wrapper handles the webengine
-  // async job poll OR the openai sync call depending on config.
+  // Step 2: ask the reviewer agent AND (for high-risk modules)
+  // the auditor agent in parallel. callAgent handles the
+  // provider routing + webengine semaphore + throttle.
   let verdict: ReviewVerdict;
   let modelUsed: string;
+  let notesMd = '';
+  let auditStatus: string | null = null;
+  let auditNotesMd: string | null = null;
   try {
     const out = await askModel(ds, task, diffTrimmed);
     verdict = out.verdict;
     modelUsed = out.model;
+    notesMd = out.notesMd;
+    auditStatus = out.auditStatus;
+    auditNotesMd = out.auditNotesMd;
   } catch (err) {
     console.error(`[rv] ${task.display_id} model call failed:`, err);
     return;
@@ -333,11 +341,28 @@ async function reviewOneClaimed(
           $1, $2::bigint, 'review'::public.task_status_enum,
           $3::public.task_status_enum,
           $4::varchar(128), 'system'::public.actor_kind_enum,
-          jsonb_build_object('reviewer_id', $4::text, 'model', $5::text, 'score', $6::int),
+          jsonb_build_object(
+            'reviewer_id', $4::text,
+            'model', $5::text,
+            'score', $6::int,
+            'review_notes_md', $7::text,
+            'audit_status', $8::text,
+            'audit_notes_md', $9::text
+          ),
           $4::varchar(128)
         )
         `,
-        [task.task_id, task.lease_version, targetStatus, REVIEWER_ID, modelUsed, verdict.score],
+        [
+          task.task_id,
+          task.lease_version,
+          targetStatus,
+          REVIEWER_ID,
+          modelUsed,
+          verdict.score,
+          notesMd,
+          auditStatus,
+          auditNotesMd,
+        ],
       );
     });
   } catch (err) {
@@ -456,71 +481,214 @@ async function failReviewTask(
   }
 }
 
+/**
+ * Build the instruction (ask.txt) that tells the reviewer model
+ * exactly what to return. Kept as a constant so the content is
+ * identical across every request and prompts stay deterministic.
+ *
+ * The ask.txt contract gives the model room to produce a detailed
+ * review — structured issues[] + positives[] + risks[] plus a
+ * multi-paragraph notes_md — instead of cramming the entire
+ * verdict into a one-sentence summary like our first iteration
+ * forced it to.
+ */
+const REVIEWER_ASK_TXT = `You are a code reviewer for the DevLoop AI bug-fix system.
+
+Files attached to this request:
+  - report.txt               — the bug report and task metadata
+  - plan.txt                 — the planner's strategy (what the
+                               worker was supposed to do). May be
+                               empty if planning was skipped.
+  - diff.txt                 — the git diff to review
+  - <filename>.full.txt × N  — the FULL post-edit content of each
+                               touched source file, so you can
+                               reason about surrounding context
+
+Read them. Compare the diff to the plan and the bug report. Then
+return EXACTLY ONE JSON object and NO other text, markdown, or
+code fences. Use this schema:
+
+{
+  "decision": "approved" | "changes_requested",
+  "score": <integer 0..100>,
+  "summary": "<one sentence, under 200 chars>",
+  "plan_adherence": "full" | "partial" | "deviates" | "no_plan",
+  "issues": [
+    {
+      "file": "<path from repo root>",
+      "line": <integer or null>,
+      "severity": "high" | "medium" | "low",
+      "description": "<what is wrong>",
+      "suggestion": "<concrete fix>"
+    }
+  ],
+  "positives": ["<things the diff did well>"],
+  "risks": ["<potential regressions or edge cases>"],
+  "notes_md": "<multi-paragraph markdown analysis that a human can read>"
+}
+
+Decision rules:
+  - "approved" if the diff plausibly fixes the bug described in
+    report.txt, does not introduce obvious regressions, and follows
+    reasonable conventions.
+  - "approved" if the diff is a small marker/stub/docs edit
+    (score around 60).
+  - "changes_requested" if the diff is destructive, off-topic,
+    removes large blocks of unrelated code, leaks secrets, or
+    fails to address the reported problem.
+
+Score guide:
+  -   0..40  — obviously bad
+  -  41..70  — stub, partial, or low-confidence fix
+  -  71..100 — solid, ready to merge
+
+Do not invent information that is not in the attached files. Every
+issue you report must cite a file from <filename>.full.txt or a
+line visible in diff.txt.`;
+
+interface ChangedFile {
+  path: string;
+  status: string; // added / modified / removed / renamed
+}
+
 async function askModel(
   ds: DataSource,
   task: TaskForReview,
   diff: string,
-): Promise<{ verdict: ReviewVerdict; model: string }> {
-  // The "system prompt" for the reviewer role is stored in
-  // agent_configs.system_prompt and is prepended by callAgent.
-  // Here we only build the user-side content.
-  const prompt = `You are a code reviewer for the DevLoop AI bug-fix system. You see a bug report and a diff that an AI worker proposed as a fix. Your job is to decide whether the diff is acceptable to forward to a human merger.
+): Promise<{
+  verdict: ReviewVerdict;
+  model: string;
+  notesMd: string;
+  auditStatus: string | null;
+  auditNotesMd: string | null;
+}> {
+  // Fetch the list of changed files + their post-edit contents
+  // from GitHub at head_sha. If this fails we still send the diff
+  // alone — the reviewer gets reduced context but can still render
+  // a verdict.
+  const changedFiles = await fetchChangedFiles(
+    task.github_owner,
+    task.github_repo,
+    task.base_sha,
+    task.head_sha,
+  );
+  const fullFiles: Array<{ name: string; content: string }> = [];
+  for (const f of changedFiles.slice(0, 10)) {
+    if (f.status === 'removed') continue;
+    const content = await fetchFileAtSha(
+      task.github_owner,
+      task.github_repo,
+      f.path,
+      task.head_sha,
+    );
+    if (content === null) continue;
+    const capped =
+      content.length > 200 * 1024
+        ? content.slice(0, 200 * 1024) + '\n\n[... truncated by reviewer: original was ' + content.length + ' bytes]\n'
+        : content;
+    fullFiles.push({
+      name: sanitizeAttachmentName(f.path) + '.full.txt',
+      content: capped,
+    });
+  }
 
-OUTPUT FORMAT — return EXACTLY a JSON object with these fields and no extra text:
-{
-  "decision": "approved" | "changes_requested",
-  "score": <integer 0..100>,
-  "summary": "<one-sentence reason in English>"
-}
+  const reportTxt = [
+    `Task ID:     ${task.display_id}`,
+    `Module:      ${task.module}`,
+    `Risk tier:   ${task.risk_tier}`,
+    `Branch:      ${task.branch_name}`,
+    `Base SHA:    ${task.base_sha}`,
+    `Head SHA:    ${task.head_sha}`,
+    ``,
+    `Title: ${task.report_title}`,
+    ``,
+    `Body:`,
+    task.report_body,
+  ].join('\n');
 
-Guidelines:
-- approved if the diff plausibly addresses the bug, does not introduce obvious regressions, and follows reasonable conventions.
-- approved if the diff is a no-op stub or marker file change (DevLoop is wired up before any real fix logic exists, so stub diffs are expected during early phases — score them ~60).
-- changes_requested if the diff is destructive, off-topic, or removes large blocks of unrelated code.
-- score is your confidence that this diff is safe to merge: 0..40 = obviously bad, 41..70 = stub or partial, 71..100 = solid.
-- Keep summary under 200 chars.
+  const planTxt = task.plan && task.plan.length > 0 ? task.plan : '(no plan — planner skipped or disabled)';
 
-Risk tier and module are provided as context; do not let them dominate the decision — small low-risk diffs can still be wrong.
+  const baseFiles: Array<{ name: string; content: string }> = [
+    { name: 'ask.txt', content: REVIEWER_ASK_TXT },
+    { name: 'report.txt', content: reportTxt },
+    { name: 'plan.txt', content: planTxt },
+    { name: 'diff.txt', content: diff },
+    ...fullFiles,
+  ];
 
-Task: ${task.display_id}
-Module: ${task.module}
-Risk tier: ${task.risk_tier}
-Branch: ${task.branch_name}
-Base: ${task.base_sha}
-Head: ${task.head_sha}
+  // Short prompt. All heavy content is in the attached files —
+  // webengine's Playwright paste misbehaves on long prompts.
+  const reviewerPrompt = 'Read ask.txt. Review the diff against the plan and report. Return only the JSON object as specified in ask.txt.';
 
-Bug report:
-=== ${task.report_title} ===
-${task.report_body}
+  // Fas H: auditor runs in PARALLEL with reviewer for high-risk
+  // modules. Both calls go through callAgent's webengine semaphore
+  // so we never exceed 5 concurrent upstream requests. If auditor
+  // says "blocking" we override an approved reviewer verdict.
+  const auditorEnabled = isHighRisk(task.module, task.risk_tier);
 
-Diff:
-\`\`\`diff
-${diff}
-\`\`\`
+  const reviewerPromise = callAgent(ds, {
+    role: 'reviewer',
+    prompt: reviewerPrompt,
+    files: baseFiles,
+  });
 
-Return your verdict as JSON now.`;
+  const auditorPromise: Promise<
+    | { ok: true; text: string; model: string }
+    | { ok: false; reason: string }
+  > = auditorEnabled
+    ? callAgent(ds, {
+        role: 'auditor',
+        prompt:
+          'Read ask.txt. Security-audit the diff and the attached full files. Return only the JSON object as specified in ask.txt.',
+        files: [
+          { name: 'ask.txt', content: AUDITOR_ASK_TXT },
+          { name: 'report.txt', content: reportTxt },
+          { name: 'diff.txt', content: diff },
+          ...fullFiles,
+        ],
+      })
+        .then(
+          (r) => ({ ok: true as const, text: r.text, model: r.model }),
+        )
+        .catch((err: Error) => ({ ok: false as const, reason: err.message }))
+    : Promise.resolve({ ok: false as const, reason: 'not high-risk' });
 
-  const result = await callAgent(ds, { role: 'reviewer', prompt });
+  const [reviewerResult, auditorResult] = await Promise.all([
+    reviewerPromise,
+    auditorPromise,
+  ]);
 
-  // The webengine response often comes back with the JSON object
-  // embedded as-is; occasionally a model wraps it in ```json ... ```.
-  // Strip fenced code blocks before parsing.
-  const stripped = stripJsonFence(result.text);
-
-  let parsed: { decision?: unknown; score?: unknown; summary?: unknown };
+  // Parse the reviewer verdict first — that's the core gate.
+  const stripped = stripJsonFence(reviewerResult.text);
+  let parsed: {
+    decision?: unknown;
+    score?: unknown;
+    summary?: unknown;
+    issues?: unknown;
+    positives?: unknown;
+    risks?: unknown;
+    notes_md?: unknown;
+    plan_adherence?: unknown;
+  };
   try {
     parsed = JSON.parse(stripped);
   } catch (err) {
     throw new Error(
-      `failed to parse model JSON: ${String(err)}; first 200 bytes: ${stripped.slice(0, 200)}`,
+      `failed to parse reviewer JSON: ${String(err)}; first 200 bytes: ${stripped.slice(0, 200)}`,
     );
   }
-  const decision = parsed.decision;
+  let rawDecision = parsed.decision;
+  if (rawDecision === 'needs_changes' || rawDecision === 'requested_changes') {
+    rawDecision = 'changes_requested';
+  }
+  if (rawDecision !== 'approved' && rawDecision !== 'changes_requested') {
+    throw new Error(`bad decision: ${String(rawDecision)}`);
+  }
+  let decision: 'approved' | 'changes_requested' = rawDecision;
   const score = parsed.score;
   const summary = parsed.summary;
-  if (decision !== 'approved' && decision !== 'changes_requested') {
-    throw new Error(`bad decision: ${String(decision)}`);
-  }
+  const notesMd =
+    typeof parsed.notes_md === 'string' ? parsed.notes_md : '';
   if (
     typeof score !== 'number' ||
     !Number.isInteger(score) ||
@@ -532,10 +700,179 @@ Return your verdict as JSON now.`;
   if (typeof summary !== 'string') {
     throw new Error('bad summary');
   }
+
+  // Process auditor (best-effort). If it succeeded and returns
+  // security_status=blocking, we override reviewer approval.
+  let auditStatus: string | null = null;
+  let auditNotesMd: string | null = null;
+  if (auditorResult.ok) {
+    try {
+      const auditJson = JSON.parse(stripJsonFence(auditorResult.text)) as {
+        security_status?: string;
+        notes_md?: string;
+      };
+      if (typeof auditJson.security_status === 'string') {
+        auditStatus = auditJson.security_status;
+      }
+      if (typeof auditJson.notes_md === 'string') {
+        auditNotesMd = auditJson.notes_md;
+      }
+      if (
+        auditStatus === 'blocking' &&
+        decision === 'approved'
+      ) {
+        console.warn(
+          `[rv] ${task.display_id} auditor OVERRIDE: reviewer said approved but auditor status=blocking — downgrading`,
+        );
+        decision = 'changes_requested';
+      }
+    } catch (err) {
+      console.warn(
+        `[rv] ${task.display_id} auditor JSON parse failed: ${String(err)}`,
+      );
+    }
+  } else if (auditorEnabled) {
+    console.warn(
+      `[rv] ${task.display_id} auditor call failed: ${auditorResult.reason}`,
+    );
+  }
+
   return {
     verdict: { decision, score, summary: summary.slice(0, 500) },
-    model: result.model,
+    model: reviewerResult.model,
+    notesMd,
+    auditStatus,
+    auditNotesMd,
   };
+}
+
+const AUDITOR_ASK_TXT = `You are a security auditor for the DevLoop AI bug-fix system.
+
+Files attached:
+  - report.txt               — bug report and task metadata
+  - diff.txt                 — the git diff
+  - <filename>.full.txt × N  — full post-edit content of each
+                               touched file
+
+Scan for:
+  - Hardcoded secrets / API keys / passwords / JWT secrets
+  - SQL injection (string-built queries, unescaped concatenation)
+  - Auth bypass (missing guards, permission checks)
+  - Path traversal (../ in file operations)
+  - Unsafe deserialization
+  - Command injection in spawn/exec calls
+  - Logging of sensitive data (tokens, secrets, full request bodies)
+
+Return EXACTLY ONE JSON object, no extra text or markdown, with
+this schema:
+
+{
+  "security_status": "clean" | "warnings" | "blocking",
+  "overall_risk": "low" | "medium" | "high" | "critical",
+  "findings": [
+    {
+      "category": "secret_leak" | "injection" | "auth_bypass" | "path_traversal" | "unsafe_deserialization" | "command_injection" | "logging_leak" | "other",
+      "severity": "low" | "medium" | "high" | "critical",
+      "file": "<path>",
+      "line": <integer or null>,
+      "description": "<what is wrong>",
+      "recommendation": "<how to fix>"
+    }
+  ],
+  "notes_md": "<multi-paragraph markdown analysis>"
+}
+
+Use "blocking" only for critical or high-severity findings that
+are clearly exploitable as written. Use "warnings" for medium
+findings you want the reviewer to be aware of but that are not
+an immediate block. Use "clean" if nothing suspicious stands out.
+
+Do not invent findings. Every finding must cite a specific file
+and (when possible) line number from the attached files.`;
+
+function isHighRisk(module: string, riskTier: string): boolean {
+  if (riskTier === 'high' || riskTier === 'critical') return true;
+  const highRiskModules = new Set([
+    'auth',
+    'backend/db',
+    'backend/telephony',
+    'devops',
+  ]);
+  return highRiskModules.has(module);
+}
+
+/**
+ * GitHub Compare API returns a JSON body (when accept=application/
+ * vnd.github+json) with a `files` array. We re-request with the
+ * JSON media type to get the file list; the text diff has already
+ * been fetched separately by fetchDiff.
+ */
+async function fetchChangedFiles(
+  owner: string,
+  repo: string,
+  base: string,
+  head: string,
+): Promise<ChangedFile[]> {
+  const url = `https://api.github.com/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/compare/${base}...${head}`;
+  const headers: Record<string, string> = {
+    'Accept': 'application/vnd.github+json',
+    'User-Agent': 'devloop-reviewer/1.0',
+    'X-GitHub-Api-Version': '2022-11-28',
+  };
+  if (GITHUB_TOKEN !== null) {
+    headers['Authorization'] = `Bearer ${GITHUB_TOKEN}`;
+  }
+  try {
+    const res = await fetch(url, { method: 'GET', headers });
+    if (!res.ok) {
+      console.warn(`[rv] fetchChangedFiles HTTP ${res.status} — proceeding with diff only`);
+      return [];
+    }
+    const body = (await res.json()) as {
+      files?: Array<{ filename?: unknown; status?: unknown }>;
+    };
+    if (!Array.isArray(body.files)) return [];
+    return body.files.flatMap((f) => {
+      if (typeof f.filename !== 'string') return [];
+      const status = typeof f.status === 'string' ? f.status : 'modified';
+      return [{ path: f.filename, status }];
+    });
+  } catch (err) {
+    console.warn(`[rv] fetchChangedFiles error: ${String(err)}`);
+    return [];
+  }
+}
+
+async function fetchFileAtSha(
+  owner: string,
+  repo: string,
+  path: string,
+  sha: string,
+): Promise<string | null> {
+  const url = `https://api.github.com/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/contents/${path.split('/').map(encodeURIComponent).join('/')}?ref=${sha}`;
+  const headers: Record<string, string> = {
+    'Accept': 'application/vnd.github.v3.raw',
+    'User-Agent': 'devloop-reviewer/1.0',
+    'X-GitHub-Api-Version': '2022-11-28',
+  };
+  if (GITHUB_TOKEN !== null) {
+    headers['Authorization'] = `Bearer ${GITHUB_TOKEN}`;
+  }
+  try {
+    const res = await fetch(url, { method: 'GET', headers });
+    if (!res.ok) return null;
+    return await res.text();
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Turn a file path into a single attachment name safe for
+ * multipart (no slashes, no leading dot).
+ */
+function sanitizeAttachmentName(p: string): string {
+  return p.replace(/[^a-zA-Z0-9._-]/g, '_').replace(/^\.+/, '');
 }
 
 function stripJsonFence(s: string): string {

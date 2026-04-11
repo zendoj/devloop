@@ -2,6 +2,7 @@ import { Inject, Injectable, NotFoundException } from '@nestjs/common';
 import { DataSource } from 'typeorm';
 import { DATA_SOURCE } from '../db/db.module';
 import { ClassifierService } from '../orchestrator/classifier.service';
+import { PlannerService } from '../orchestrator/planner.service';
 
 /**
  * Shape returned by GET /api/reports list endpoint. No reporter_user_id
@@ -54,6 +55,7 @@ export class ReportsService {
   constructor(
     @Inject(DATA_SOURCE) private readonly ds: DataSource,
     private readonly classifier: ClassifierService,
+    private readonly planner: PlannerService,
   ) {}
 
   /**
@@ -243,7 +245,7 @@ export class ReportsService {
       description,
     );
 
-    return this.ds.transaction(async (manager) => {
+    const result = await this.ds.transaction(async (manager) => {
       const inserted = (await manager.query(
         `
         INSERT INTO public.reports (project_id, title, description, reporter_user_id)
@@ -272,6 +274,30 @@ export class ReportsService {
 
       return { report_id: reportId, task_id: taskId };
     });
+
+    // Fas H: run the planner AFTER the task row exists but OUTSIDE
+    // the insert transaction. If planner fails or is disabled we
+    // still return the task — Claude will plan internally as a
+    // fallback. Running outside the txn keeps the report insert
+    // fast and prevents a long planner call from holding row
+    // locks on reports/agent_tasks.
+    if (result.task_id) {
+      try {
+        await this.planner.planForTask(
+          result.task_id,
+          title,
+          description,
+          classification.module,
+          classification.risk_tier,
+        );
+      } catch (err) {
+        // Logged by planner.service already; swallow so the
+        // intake request still returns successfully.
+        void err;
+      }
+    }
+
+    return result;
   }
 
   public async addThread(input: AddThreadInput): Promise<{ id: string }> {

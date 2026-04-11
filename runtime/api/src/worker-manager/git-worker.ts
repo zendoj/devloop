@@ -56,6 +56,15 @@ export interface WorkerRunInput {
   defaultBranch: string;
   reportTitle: string;
   reportBody: string;
+  /** Planner output (from agent_configs 'planner' role), or null if planner disabled / skipped */
+  plan: string | null;
+  /** Prior human-feedback entries from task_feedback, oldest first */
+  feedback: Array<{
+    attempt_number: number;
+    feedback_text: string;
+    files: Array<{ name: string; size: number; content: string }>;
+    reported_at: string;
+  }>;
   githubToken: string;
   workerId: string;
 }
@@ -140,12 +149,59 @@ esac
     // Branch off the default branch.
     await runGit(['checkout', '-b', branchName], workDir, safeToken, askpassEnv);
 
+    // Fas H: write planner output + accumulated human-reject
+    // feedback into the worktree as .devloop/plan.md + files
+    // under .devloop/feedback/attempt-N/. Claude reads them via
+    // --add-dir and uses them as extra context without needing
+    // another tool invocation.
+    const devloopDir = `${workDir}/.devloop`;
+    await mkdir(devloopDir, { recursive: true });
+    if (input.plan && input.plan.length > 0) {
+      await writeFile(`${devloopDir}/plan.md`, input.plan, 'utf8');
+    }
+    await writeFile(
+      `${devloopDir}/report.md`,
+      `# ${input.reportTitle}\n\n${input.reportBody}\n`,
+      'utf8',
+    );
+    for (const fb of input.feedback) {
+      const attemptDir = `${devloopDir}/feedback/attempt-${fb.attempt_number}`;
+      await mkdir(attemptDir, { recursive: true });
+      await writeFile(
+        `${attemptDir}/feedback.md`,
+        `Reported at: ${fb.reported_at}\n\n${fb.feedback_text}\n`,
+        'utf8',
+      );
+      for (const f of fb.files) {
+        // Files are stored base64-encoded in the DB (per
+        // tasks.controller reject handler). Decode on the way
+        // out so Claude sees real bytes.
+        const bytes = Buffer.from(f.content, 'base64');
+        await writeFile(`${attemptDir}/${f.name}`, bytes);
+      }
+    }
+
     // Hand the task to Claude. It runs inside workDir with Read/
     // Edit/Write + a narrow Bash allowlist and is capped by a USD
     // budget. If Claude errors or makes no file changes we fail
     // the task — the caller transitions to 'failed'.
     const sanitizedTitle = input.reportTitle.replace(/[\r\n]/g, ' ').slice(0, 200);
-    const claudeResult = await runClaude(workDir, sanitizedTitle, input.reportBody);
+    const claudeResult = await runClaude(
+      workDir,
+      sanitizedTitle,
+      input.reportBody,
+      input.plan,
+      input.feedback.length > 0,
+    );
+
+    // Before staging, strip .devloop/ out of the worktree — it's
+    // scratch context for Claude, not part of the commit. rm -rf
+    // is bounded to a hardcoded subdir of the worktree.
+    try {
+      await rm(devloopDir, { recursive: true, force: true });
+    } catch {
+      /* non-fatal */
+    }
 
     // Detect whether Claude actually changed anything. An empty
     // worktree status means Claude produced no fix and the task
@@ -292,11 +348,32 @@ async function runClaude(
   worktree: string,
   title: string,
   body: string,
+  plan: string | null,
+  hasPriorFeedback: boolean,
 ): Promise<ClaudeResult> {
-  const systemPrompt = [
+  const systemPromptLines = [
     'You are DevLoop Worker, an autonomous bug-fixer running inside',
     'a fresh git worktree. Your job: read the bug report below and',
     'make the smallest possible code change to fix it.',
+    '',
+    'Context files in .devloop/ (read-only for you, NOT part of the commit):',
+    '  .devloop/report.md — the original bug report',
+  ];
+  if (plan && plan.length > 0) {
+    systemPromptLines.push(
+      '  .devloop/plan.md   — the planner\'s strategy. Follow it',
+      '                        unless you see it is wrong.',
+    );
+  }
+  if (hasPriorFeedback) {
+    systemPromptLines.push(
+      '  .devloop/feedback/attempt-N/ — previous human rejections.',
+      '                        Read every attempt-N/feedback.md and any',
+      '                        attached screenshots/logs. Address',
+      '                        each concern before making your fix.',
+    );
+  }
+  systemPromptLines.push(
     '',
     'Hard rules:',
     '- Do NOT refactor unrelated code.',
@@ -304,14 +381,45 @@ async function runClaude(
     '- Do NOT create new files unless the fix absolutely requires it.',
     '- Do NOT run destructive shell commands.',
     '- Do NOT commit or push — the worker handles git.',
+    '- Do NOT modify anything inside .devloop/ — that directory is',
+    '  stripped before commit and is context only.',
     '- If you cannot determine a safe fix, edit nothing and explain',
     '  why in your final message; the worker will fail the task.',
     '',
     'When you are done editing, end your final message with a short',
     'one-paragraph summary of what you changed and why.',
-  ].join('\n');
+  );
+  const systemPrompt = systemPromptLines.join('\n');
 
-  const userPrompt = `# Bug report: ${title}\n\n${body}`;
+  const userPromptParts: string[] = [`# Bug report: ${title}`, '', body];
+  if (plan && plan.length > 0) {
+    userPromptParts.push(
+      '',
+      '## Planner output',
+      '',
+      'The Planner agent produced this strategy before you were',
+      'invoked. You can read it in full at .devloop/plan.md. It',
+      'is a recommendation, not a command — you have the actual',
+      'code open and can deviate if you see something the',
+      'planner missed.',
+      '',
+      plan.slice(0, 4000),
+    );
+  }
+  if (hasPriorFeedback) {
+    userPromptParts.push(
+      '',
+      '## Prior human rejections',
+      '',
+      'This is not the first attempt at this task. A previous',
+      'version of your work was deployed and a human rejected it',
+      'because it did not actually fix the reported problem when',
+      'tried in the running product. Read every file under',
+      '.devloop/feedback/ and make sure your new attempt addresses',
+      'each issue raised.',
+    );
+  }
+  const userPrompt = userPromptParts.join('\n');
 
   const args = [
     '-p',

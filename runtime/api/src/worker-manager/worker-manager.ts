@@ -222,6 +222,13 @@ interface TaskContext {
   report_id: string;
   report_title: string;
   report_body: string;
+  plan: string | null;
+  feedback: Array<{
+    attempt_number: number;
+    feedback_text: string;
+    files: Array<{ name: string; size: number; content: string }>;
+    reported_at: string;
+  }>;
 }
 
 async function processOne(
@@ -290,6 +297,8 @@ async function processOne(
         defaultBranch: ctx.default_branch,
         reportTitle: ctx.report_title,
         reportBody: ctx.report_body,
+        plan: ctx.plan,
+        feedback: ctx.feedback,
         githubToken: GITHUB_TOKEN,
         workerId: WORKER_ID,
       });
@@ -376,7 +385,8 @@ async function loadTaskContext(
       p.github_default_branch AS default_branch,
       r.id             AS report_id,
       r.title          AS report_title,
-      r.description    AS report_body
+      r.description    AS report_body,
+      at.plan
     FROM public.agent_tasks at
     JOIN public.projects p ON p.id = at.project_id
     JOIN public.reports  r ON r.id = at.report_id
@@ -385,7 +395,25 @@ async function loadTaskContext(
     `,
     [taskId],
   )) as Array<TaskContext>;
-  return rows[0] ?? null;
+  const ctx = rows[0];
+  if (!ctx) return null;
+
+  // Load human-feedback history so the worker can drop each
+  // attempt's feedback files into .devloop/feedback/attempt-N/
+  // in the worktree before Claude runs. Newest attempt last so
+  // Claude sees them in the order Jonas wrote them.
+  const feedback = (await ds.query(
+    `
+    SELECT attempt_number, feedback_text, files, reported_at
+      FROM public.task_feedback
+     WHERE task_id = $1
+     ORDER BY attempt_number ASC
+    `,
+    [taskId],
+  )) as TaskContext['feedback'];
+  ctx.feedback = feedback ?? [];
+  ctx.plan = ctx.plan ?? null;
+  return ctx;
 }
 
 async function failTask(

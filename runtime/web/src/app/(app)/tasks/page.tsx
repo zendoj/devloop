@@ -80,12 +80,12 @@ export default async function TasksPage(): Promise<React.ReactElement> {
               {items.map((t) => (
                 <tr key={t.id} className="row-link">
                   <td className="mono">
-                    <Link href={`/reports/${t.report_id}`} className="row-cell">
+                    <Link href={`/tasks/${t.id}`} className="row-cell">
                       {t.display_id}
                     </Link>
                   </td>
                   <td>
-                    <Link href={`/reports/${t.report_id}`} className="row-cell">
+                    <Link href={`/tasks/${t.id}`} className="row-cell">
                       {t.report_title}
                     </Link>
                   </td>

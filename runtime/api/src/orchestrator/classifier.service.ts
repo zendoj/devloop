@@ -125,9 +125,12 @@ export class ClassifierService {
   }
 
   /**
-   * Classify via the `classifier` agent role. Returns null if the
-   * AI picks an out-of-allowlist module (so the caller falls back
-   * to regex rules). Throws on infra failure.
+   * Classify via the `classifier` agent role using the file-upload
+   * pattern. Sends ask.txt (instructions + schema + allowed
+   * values) and report.txt (rapport-innehåll). Returns null on
+   * any failure so the caller falls back to regex rules — the
+   * pipeline must stay bounded-latency and deterministic even
+   * when the AI provider is flaky.
    */
   private async classifyWithAi(
     title: string,
@@ -138,25 +141,59 @@ export class ClassifierService {
       rules.default_module,
       ...rules.rules.map((r) => r.module),
     ]);
-    const moduleList = Array.from(allowedModules).sort().join(', ');
+    const moduleList = Array.from(allowedModules).sort();
     const validRiskTiers: RiskTier[] = ['low', 'standard', 'high', 'critical'];
 
-    const prompt = `Classify this bug report into a module and a risk tier.
+    const askTxt = `You classify bug reports for the DevLoop pipeline.
 
-Allowed modules: ${moduleList}
-Allowed risk_tier: ${validRiskTiers.join(', ')}
+Pick exactly one module and one risk_tier from the allowed lists.
 
-Return ONLY a JSON object with exactly these keys and no extra text:
-{"module":"<one of the allowed modules>","risk_tier":"<one of the allowed tiers>"}
+Allowed modules (choose ONE):
+${moduleList.map((m) => `  - ${m}`).join('\n')}
 
-Report title: ${title}
-Report description:
-${description.slice(0, 4000)}`;
+Allowed risk_tiers:
+${validRiskTiers.map((t) => `  - ${t}`).join('\n')}
 
-    const result = await callAgent(this.ds, {
-      role: 'classifier',
-      prompt,
-    });
+Guidance:
+  - low       — cosmetic, docs, styling
+  - standard  — normal feature-level bug
+  - high      — auth, data-loss risk, payment, privacy
+  - critical  — production outage, security incident
+
+Return EXACTLY ONE JSON object and NO other text, markdown, or
+code fences:
+
+{
+  "module": "<one of the allowed modules>",
+  "risk_tier": "<one of the allowed tiers>",
+  "confidence": <float 0..1>,
+  "reasoning": "<one sentence, under 150 chars>"
+}
+
+Use module 'unknown' ONLY if the report truly does not fit any
+of the listed modules — prefer a best-effort guess.`;
+
+    const reportTxt = `Title: ${title}\n\nDescription:\n${description.slice(0, 8000)}`;
+
+    const prompt =
+      'Read ask.txt for instructions. Classify the report in report.txt. Return only the JSON object.';
+
+    let result;
+    try {
+      result = await callAgent(this.ds, {
+        role: 'classifier',
+        prompt,
+        files: [
+          { name: 'ask.txt', content: askTxt },
+          { name: 'report.txt', content: reportTxt },
+        ],
+      });
+    } catch (err) {
+      this.logger.warn(
+        `classifier call failed: ${(err as Error).message}`,
+      );
+      return null;
+    }
 
     const stripped = stripJsonFence(result.text);
     let parsed: { module?: unknown; risk_tier?: unknown };

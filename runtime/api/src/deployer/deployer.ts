@@ -4,6 +4,7 @@ import { createPrivateKey, sign as cryptoSign } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import { DataSource } from 'typeorm';
 import { buildDataSource } from '../data-source';
+import { callAgent, stripJsonFence } from '../agents/call-agent';
 import { jcs } from './jcs';
 
 /**
@@ -226,7 +227,7 @@ async function deployOne(ds: DataSource, t: ApprovedTask): Promise<void> {
   // is worse under contention.
   let prResult: PrResult;
   try {
-    prResult = await createAndMergePr(t);
+    prResult = await createAndMergePr(ds, t);
   } catch (err) {
     console.error(`[dp] ${t.display_id} PR step failed:`, err);
     // Leave task in 'approved' — next iteration retries. If
@@ -386,11 +387,17 @@ async function verifyVerifying(ds: DataSource): Promise<void> {
   for (const t of rows) {
     if (!running) break;
     try {
+      // Fas H: verifying → ready_for_test (waiting on human
+      // acceptance test in the running product). The pipeline
+      // considers the task "done from the AI side" at this
+      // point — the final human gate is handled via the
+      // /api/tasks/:id/approve and /reject endpoints, not the
+      // deployer poll loop.
       await ds.query(
         `
         SELECT public.fence_and_transition(
           $1, $2::bigint, 'verifying'::public.task_status_enum,
-          'verified'::public.task_status_enum,
+          'ready_for_test'::public.task_status_enum,
           $3::varchar(128), 'system'::public.actor_kind_enum,
           jsonb_build_object('deployer_id', $3::text),
           $3::varchar(128)
@@ -398,9 +405,9 @@ async function verifyVerifying(ds: DataSource): Promise<void> {
         `,
         [t.task_id, t.lease_version, DEPLOYER_ID],
       );
-      console.log(`[dp] ${t.display_id} → verified ✓`);
+      console.log(`[dp] ${t.display_id} → ready_for_test (awaiting human acceptance test)`);
     } catch (err) {
-      console.error(`[dp] ${t.display_id} verify transition failed:`, err);
+      console.error(`[dp] ${t.display_id} ready_for_test transition failed:`, err);
     }
   }
 }
@@ -665,7 +672,10 @@ async function verifyRollback(ds: DataSource): Promise<void> {
  * checks are missing, the merge call returns 405/422 and we
  * throw.
  */
-async function createAndMergePr(t: ApprovedTask): Promise<PrResult> {
+async function createAndMergePr(
+  ds: DataSource,
+  t: ApprovedTask,
+): Promise<PrResult> {
   if (GITHUB_TOKEN.length === 0) {
     throw new Error('github_token not loaded');
   }
@@ -679,21 +689,40 @@ async function createAndMergePr(t: ApprovedTask): Promise<PrResult> {
 
   const repo = `${t.github_owner}/${t.github_repo}`;
 
+  // Fas H: ask the summarizer agent to produce the PR title +
+  // body. Best-effort — on any failure we fall back to the old
+  // hardcoded template. The summarizer uses the file-upload
+  // pattern: ask.txt + report.txt + context (plan / review_notes
+  // if available on the task row).
+  const fallbackTitle = `devloop(${t.display_id}): ${t.report_title}`.slice(0, 250);
+  const fallbackBody = [
+    `DevLoop task: ${t.display_id}`,
+    `Module: ${t.module}`,
+    `Base SHA: ${t.base_sha}`,
+    `Head SHA: ${t.head_sha}`,
+    '',
+    'This PR was opened automatically by the DevLoop deployer',
+    'after the reviewer approved the diff.',
+  ].join('\n');
+
+  let prTitle = fallbackTitle;
+  let prBody = fallbackBody;
+  try {
+    const s = await summarizePr(ds, t);
+    if (s) {
+      prTitle = s.title.slice(0, 250);
+      prBody = s.body;
+    }
+  } catch (err) {
+    console.warn(`[dp] ${t.display_id} summarizer failed: ${(err as Error).message}`);
+  }
+
   // Step 1: create the PR. If a PR already exists for this
   // branch (e.g. a previous retry), GitHub returns 422 with
   // a specific error message; we then look up the existing PR.
   const createBody = {
-    title: `devloop(${t.display_id}): ${t.report_title}`.slice(0, 250),
-    body: [
-      `DevLoop task: ${t.display_id}`,
-      `Module: ${t.module}`,
-      `Base SHA: ${t.base_sha}`,
-      `Head SHA: ${t.head_sha}`,
-      '',
-      'This PR was opened automatically by the DevLoop deployer',
-      'after gpt-5.4 reasoning=medium reviewed the diff and',
-      'marked the task approved.',
-    ].join('\n'),
+    title: prTitle,
+    body: prBody,
     head: t.branch_name,
     base: t.default_branch,
     maintainer_can_modify: false,
@@ -736,7 +765,7 @@ async function createAndMergePr(t: ApprovedTask): Promise<PrResult> {
   const mergeUrl = `https://api.github.com/repos/${t.github_owner}/${t.github_repo}/pulls/${prNumber}/merge`;
   const mergeBody = {
     merge_method: 'squash',
-    commit_title: `devloop(${t.display_id}): ${t.report_title}`.slice(0, 250),
+    commit_title: prTitle,
     commit_message: [
       `DevLoop task: ${t.display_id}`,
       `Auto-merged by devloop-deployer after gpt-5.4 review.`,
@@ -756,6 +785,93 @@ async function createAndMergePr(t: ApprovedTask): Promise<PrResult> {
     throw new Error(`PR merge unexpected response: ${JSON.stringify(merged).slice(0, 200)}`);
   }
   return { pr_number: prNumber, merge_sha: merged.sha };
+}
+
+const SUMMARIZER_ASK_TXT = `You summarise a DevLoop AI bug-fix for a GitHub pull request.
+
+Files attached:
+  - report.txt        — original bug report + task metadata
+  - plan.txt          — the planner's strategy (may be empty)
+  - review_notes.txt  — the reviewer's prose analysis (may be empty)
+
+Return EXACTLY ONE JSON object and NO other text or markdown:
+
+{
+  "pr_title": "<conventional commits style, max 70 chars>",
+  "pr_body_md": "<markdown body, 2-4 paragraphs, explains what the change does and why, includes a reference to the DevLoop task id>"
+}
+
+Rules:
+  - Title format: "<type>(<module>): <short description>" where
+    type is fix|feat|chore|docs|refactor|test as appropriate.
+  - Body must mention the DevLoop task id (e.g. T-14) somewhere.
+  - Body should NOT contain the full diff — that's in the PR
+    already. Just explain the context and intent.
+  - Do not invent facts. If the report is vague, keep the body short.`;
+
+async function summarizePr(
+  ds: DataSource,
+  t: ApprovedTask,
+): Promise<{ title: string; body: string } | null> {
+  // Pull the task's plan + review_notes directly — ApprovedTask
+  // doesn't carry them, so a small SELECT keeps the summarizer
+  // self-contained without touching the deploy-critical path.
+  const rows = (await ds.query(
+    `SELECT plan, review_notes_md FROM public.agent_tasks WHERE id = $1`,
+    [t.task_id],
+  )) as Array<{ plan: string | null; review_notes_md: string | null }>;
+  const row = rows[0] ?? { plan: null, review_notes_md: null };
+
+  const reportTxt = [
+    `Task ID:   ${t.display_id}`,
+    `Module:    ${t.module}`,
+    `Base SHA:  ${t.base_sha}`,
+    `Head SHA:  ${t.head_sha}`,
+    '',
+    `Title: ${t.report_title}`,
+  ].join('\n');
+
+  let result;
+  try {
+    result = await callAgent(ds, {
+      role: 'summarizer',
+      prompt:
+        'Read ask.txt. Summarise the change into a PR title + body. Return only the JSON object.',
+      files: [
+        { name: 'ask.txt', content: SUMMARIZER_ASK_TXT },
+        { name: 'report.txt', content: reportTxt },
+        { name: 'plan.txt', content: row.plan ?? '(no plan)' },
+        {
+          name: 'review_notes.txt',
+          content: row.review_notes_md ?? '(no reviewer notes)',
+        },
+      ],
+    });
+  } catch (err) {
+    console.warn(
+      `[dp] ${t.display_id} summarizer callAgent failed: ${(err as Error).message}`,
+    );
+    return null;
+  }
+
+  const stripped = stripJsonFence(result.text);
+  let parsed: { pr_title?: unknown; pr_body_md?: unknown };
+  try {
+    parsed = JSON.parse(stripped);
+  } catch {
+    console.warn(
+      `[dp] ${t.display_id} summarizer returned non-JSON: ${stripped.slice(0, 200)}`,
+    );
+    return null;
+  }
+  if (
+    typeof parsed.pr_title !== 'string' ||
+    typeof parsed.pr_body_md !== 'string' ||
+    parsed.pr_title.length === 0
+  ) {
+    return null;
+  }
+  return { title: parsed.pr_title, body: parsed.pr_body_md };
 }
 
 function sleep(ms: number): Promise<void> {

@@ -115,7 +115,7 @@ export class TasksService {
         (SELECT COUNT(*) FROM public.reports
           WHERE status IN ('new','triaged','in_progress','needs_info'))::int AS reports_open,
         (SELECT COUNT(*) FROM public.agent_tasks
-          WHERE status NOT IN ('verified','rolled_back','rollback_failed','failed','cancelled'))::int AS tasks_active,
+          WHERE status NOT IN ('verified','accepted','rolled_back','rollback_failed','failed','cancelled'))::int AS tasks_active,
         (SELECT COUNT(*) FROM public.desired_state_history
           WHERE applied_status = 'success' AND applied_at > now() - interval '7 days')::int AS deploys_last_7d
       `,
@@ -129,4 +129,224 @@ export class TasksService {
       }
     );
   }
+
+  /**
+   * Fetch one task with all the detail the /tasks/:id view needs:
+   * plan, diff metadata, reviewer notes, audit notes, feedback
+   * history. One query with LEFT JOINs + a second query for the
+   * per-task feedback rows.
+   */
+  public async getOne(
+    id: string,
+    callerRole: string,
+  ): Promise<TaskDetail | null> {
+    if (callerRole !== 'admin' && callerRole !== 'super_admin') {
+      return null;
+    }
+    const rows = (await this.ds.query(
+      `
+      SELECT
+        at.id::text               AS id,
+        at.display_id,
+        at.project_id::text       AS project_id,
+        p.slug                    AS project_slug,
+        p.github_owner,
+        p.github_repo,
+        at.report_id::text        AS report_id,
+        r.title                   AS report_title,
+        r.description             AS report_body,
+        at.module,
+        at.risk_tier::text        AS risk_tier,
+        at.status::text           AS status,
+        at.branch_name,
+        at.plan,
+        at.approved_base_sha,
+        at.approved_head_sha,
+        at.review_decision::text  AS review_decision,
+        at.review_score,
+        at.review_model_used,
+        at.review_notes_md,
+        at.audit_status,
+        at.audit_notes_md,
+        at.github_pr_number,
+        at.merged_commit_sha,
+        at.retry_count,
+        at.lease_version,
+        at.created_at,
+        at.completed_at,
+        at.human_approved_at,
+        at.failure_reason
+      FROM public.agent_tasks at
+      JOIN public.projects p ON p.id = at.project_id
+      JOIN public.reports  r ON r.id = at.report_id
+      WHERE at.id = $1
+      LIMIT 1
+      `,
+      [id],
+    )) as Array<TaskDetail>;
+    const task = rows[0];
+    if (!task) return null;
+
+    const feedback = (await this.ds.query(
+      `
+      SELECT
+        id::int AS id,
+        attempt_number,
+        feedback_text,
+        files,
+        reported_at
+      FROM public.task_feedback
+      WHERE task_id = $1
+      ORDER BY id DESC
+      `,
+      [id],
+    )) as Array<TaskFeedbackRow>;
+
+    task.feedback = feedback;
+    return task;
+  }
+
+  /**
+   * Approve a task (human acceptance test passed). Transitions
+   * ready_for_test → accepted. Terminal.
+   */
+  public async approve(id: string, userId: string): Promise<void> {
+    const row = (await this.ds.query(
+      `SELECT lease_version FROM public.agent_tasks WHERE id = $1 AND status = 'ready_for_test'`,
+      [id],
+    )) as Array<{ lease_version: string | number }>;
+    const lease = row[0]?.lease_version;
+    if (lease === undefined) {
+      throw new Error('task not in ready_for_test');
+    }
+    await this.ds.query(
+      `
+      SELECT public.fence_and_transition(
+        $1, $2::bigint, 'ready_for_test'::public.task_status_enum,
+        'accepted'::public.task_status_enum,
+        $3::varchar(128), 'user'::public.actor_kind_enum,
+        jsonb_build_object(
+          'human_approved_at', now()::text,
+          'human_approved_by', $4::text
+        ),
+        NULL::varchar(128)
+      )
+      `,
+      [id, Number(lease), `user:${userId}`, userId],
+    );
+  }
+
+  /**
+   * Reject a task with feedback. Saves the feedback + files to
+   * task_feedback and transitions ready_for_test → assigned so
+   * Claude runs the task again with the feedback files copied
+   * into the worktree on next worker spawn.
+   */
+  public async reject(
+    id: string,
+    userId: string,
+    feedbackText: string,
+    files: Array<{ name: string; content: string; size: number }>,
+  ): Promise<void> {
+    if (!feedbackText || feedbackText.trim().length === 0) {
+      throw new Error('feedback_text required');
+    }
+    const row = (await this.ds.query(
+      `SELECT lease_version, retry_count FROM public.agent_tasks WHERE id = $1 AND status = 'ready_for_test'`,
+      [id],
+    )) as Array<{ lease_version: string | number; retry_count: number }>;
+    const current = row[0];
+    if (!current) {
+      throw new Error('task not in ready_for_test');
+    }
+
+    const attemptNumber = Number(current.retry_count) + 1;
+
+    await this.ds.transaction(async (m) => {
+      // Save feedback row first so it's there when the worker
+      // re-spawns Claude.
+      await m.query(
+        `
+        INSERT INTO public.task_feedback
+          (task_id, attempt_number, reported_by, feedback_text, files)
+        VALUES ($1, $2, $3, $4, $5::jsonb)
+        `,
+        [
+          id,
+          attemptNumber,
+          userId,
+          feedbackText.slice(0, 20000),
+          JSON.stringify(
+            files.map((f) => ({
+              name: f.name,
+              size: f.size,
+              content: f.content, // base64 for binary, utf8 for text
+            })),
+          ),
+        ],
+      );
+
+      // Transition ready_for_test → assigned. fence_and_transition
+      // increments retry_count and keeps the module lock held.
+      await m.query(
+        `
+        SELECT public.fence_and_transition(
+          $1, $2::bigint, 'ready_for_test'::public.task_status_enum,
+          'assigned'::public.task_status_enum,
+          $3::varchar(128), 'user'::public.actor_kind_enum,
+          jsonb_build_object('failure_reason', $4::text),
+          NULL::varchar(128)
+        )
+        `,
+        [
+          id,
+          Number(current.lease_version),
+          `user:${userId}`,
+          `human rejected with feedback (attempt ${attemptNumber})`,
+        ],
+      );
+    });
+  }
+}
+
+export interface TaskDetail {
+  id: string;
+  display_id: string;
+  project_id: string;
+  project_slug: string;
+  github_owner: string;
+  github_repo: string;
+  report_id: string;
+  report_title: string;
+  report_body: string;
+  module: string;
+  risk_tier: string;
+  status: string;
+  branch_name: string | null;
+  plan: string | null;
+  approved_base_sha: string | null;
+  approved_head_sha: string | null;
+  review_decision: string | null;
+  review_score: number | null;
+  review_model_used: string | null;
+  review_notes_md: string | null;
+  audit_status: string | null;
+  audit_notes_md: string | null;
+  github_pr_number: number | null;
+  merged_commit_sha: string | null;
+  retry_count: number;
+  lease_version: number;
+  created_at: string;
+  completed_at: string | null;
+  human_approved_at: string | null;
+  failure_reason: string | null;
+  feedback?: TaskFeedbackRow[];
+}
+
+export interface TaskFeedbackRow {
+  id: number;
+  attempt_number: number;
+  feedback_text: string;
+  files: Array<{ name: string; size: number; content: string }>;
+  reported_at: string;
 }
