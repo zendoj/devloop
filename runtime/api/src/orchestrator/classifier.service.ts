@@ -1,0 +1,160 @@
+import { Inject, Injectable, Logger } from '@nestjs/common';
+import { DataSource } from 'typeorm';
+import { DATA_SOURCE } from '../db/db.module';
+
+/**
+ * Shape of the classifier_rules JSONB column on project_configs.
+ * Matches what the classifier expects:
+ *
+ *   {
+ *     "rules": [
+ *       { "match": "login|sign in|auth",  "module": "auth",        "risk_tier": "high" },
+ *       { "match": "db|database|query",   "module": "backend/db",  "risk_tier": "standard" },
+ *       { "match": "style|css|layout",    "module": "frontend/ui", "risk_tier": "low" }
+ *     ],
+ *     "default_module": "unknown",
+ *     "default_risk_tier": "standard"
+ *   }
+ *
+ * Rules are applied in order; the first match wins. Match is a
+ * JavaScript-compatible regex that runs case-insensitively against
+ * the concatenation of report title + description.
+ */
+export interface ClassifierRules {
+  rules: ClassifierRule[];
+  default_module: string;
+  default_risk_tier: RiskTier;
+}
+
+export interface ClassifierRule {
+  match: string;
+  module: string;
+  risk_tier: RiskTier;
+}
+
+export type RiskTier = 'low' | 'standard' | 'high' | 'critical';
+
+export interface ClassificationResult {
+  module: string;
+  risk_tier: RiskTier;
+  matched_rule: string | null;
+  config_id: string | null;
+}
+
+/**
+ * Fallback classifier used when a project has no active
+ * project_configs row. This is the shape most projects actually
+ * start with — nobody wants to configure classifier rules before
+ * the first bug report lands.
+ */
+const DEFAULT_RULES: ClassifierRules = {
+  rules: [
+    { match: '\\b(login|sign\\s*in|auth|password|2fa|otp)\\b', module: 'auth', risk_tier: 'high' },
+    { match: '\\b(payment|billing|invoice|checkout)\\b', module: 'billing', risk_tier: 'critical' },
+    { match: '\\b(database|db|query|sql|migration)\\b', module: 'backend/db', risk_tier: 'standard' },
+    { match: '\\b(api|endpoint|request|response|status\\s*code)\\b', module: 'backend/api', risk_tier: 'standard' },
+    { match: '\\b(style|css|layout|theme|dark\\s*mode)\\b', module: 'frontend/ui', risk_tier: 'low' },
+    { match: '\\b(button|form|input|click|render)\\b', module: 'frontend', risk_tier: 'standard' },
+    { match: '\\b(email|inbox|imap|smtp)\\b', module: 'email', risk_tier: 'high' },
+    { match: '\\b(phone|call|sip|webrtc|46elks)\\b', module: 'telephony', risk_tier: 'high' },
+  ],
+  default_module: 'unknown',
+  default_risk_tier: 'standard',
+};
+
+@Injectable()
+export class ClassifierService {
+  private readonly logger = new Logger(ClassifierService.name);
+
+  constructor(@Inject(DATA_SOURCE) private readonly ds: DataSource) {}
+
+  public async classify(
+    projectId: string,
+    title: string,
+    description: string,
+  ): Promise<ClassificationResult> {
+    const rules = await this.loadRules(projectId);
+    const text = `${title}\n${description}`.toLowerCase();
+
+    for (const rule of rules.rules) {
+      let re: RegExp;
+      try {
+        re = new RegExp(rule.match, 'i');
+      } catch (err) {
+        this.logger.warn(
+          `classifier rule has invalid regex ${rule.match}: ${String(err)}`,
+        );
+        continue;
+      }
+      if (re.test(text)) {
+        return {
+          module: rule.module,
+          risk_tier: rule.risk_tier,
+          matched_rule: rule.match,
+          config_id: null,
+        };
+      }
+    }
+
+    return {
+      module: rules.default_module,
+      risk_tier: rules.default_risk_tier,
+      matched_rule: null,
+      config_id: null,
+    };
+  }
+
+  /**
+   * Load the active project_configs row and extract classifier_rules.
+   * Falls back to DEFAULT_RULES if the project has no active config
+   * or the stored rules do not pass a minimal shape check.
+   */
+  private async loadRules(projectId: string): Promise<ClassifierRules> {
+    const rows = (await this.ds.query(
+      `
+      SELECT id, classifier_rules
+        FROM public.project_configs
+       WHERE project_id = $1
+         AND is_active = true
+       LIMIT 1
+      `,
+      [projectId],
+    )) as Array<{ id: string; classifier_rules: unknown }>;
+
+    const row = rows[0];
+    if (!row) {
+      return DEFAULT_RULES;
+    }
+
+    const raw = row.classifier_rules;
+    if (typeof raw !== 'object' || raw === null) {
+      this.logger.warn(
+        `project_configs ${row.id} has non-object classifier_rules; using DEFAULT_RULES`,
+      );
+      return DEFAULT_RULES;
+    }
+    const r = raw as Record<string, unknown>;
+    if (!Array.isArray(r.rules)) {
+      return DEFAULT_RULES;
+    }
+    return {
+      rules: r.rules.filter(
+        (x: unknown): x is ClassifierRule =>
+          typeof x === 'object' &&
+          x !== null &&
+          typeof (x as ClassifierRule).match === 'string' &&
+          typeof (x as ClassifierRule).module === 'string' &&
+          typeof (x as ClassifierRule).risk_tier === 'string',
+      ),
+      default_module:
+        typeof r.default_module === 'string'
+          ? r.default_module
+          : DEFAULT_RULES.default_module,
+      default_risk_tier:
+        typeof r.default_risk_tier === 'string' &&
+        ['low', 'standard', 'high', 'critical'].includes(r.default_risk_tier)
+          ? (r.default_risk_tier as RiskTier)
+          : DEFAULT_RULES.default_risk_tier,
+    };
+  }
+}

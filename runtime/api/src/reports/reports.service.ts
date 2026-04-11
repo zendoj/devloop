@@ -1,6 +1,7 @@
 import { Inject, Injectable, NotFoundException } from '@nestjs/common';
 import { DataSource } from 'typeorm';
 import { DATA_SOURCE } from '../db/db.module';
+import { ClassifierService } from '../orchestrator/classifier.service';
 
 /**
  * Shape returned by GET /api/reports list endpoint. No reporter_user_id
@@ -50,7 +51,10 @@ export interface AddThreadInput {
 
 @Injectable()
 export class ReportsService {
-  constructor(@Inject(DATA_SOURCE) private readonly ds: DataSource) {}
+  constructor(
+    @Inject(DATA_SOURCE) private readonly ds: DataSource,
+    private readonly classifier: ClassifierService,
+  ) {}
 
   /**
    * List recent reports visible to the caller. Fas 1c: admins see all,
@@ -230,6 +234,15 @@ export class ReportsService {
       throw new Error('description must be 1..50000 chars');
     }
 
+    // Classify BEFORE opening the transaction so the classifier
+    // can read project_configs without holding row locks. The
+    // classification is pure (read-only) and stable.
+    const classification = await this.classifier.classify(
+      input.projectId,
+      title,
+      description,
+    );
+
     return this.ds.transaction(async (manager) => {
       const inserted = (await manager.query(
         `
@@ -245,10 +258,17 @@ export class ReportsService {
       }
 
       const taskRows = (await manager.query(
-        `SELECT public.orchestrate_task_for_report($1) AS task_id`,
-        [reportId],
-      )) as Array<{ task_id: string | null }>;
-      const taskId = taskRows[0]?.task_id ?? null;
+        `
+        SELECT out_task_id, out_display_id, out_status::text AS out_status
+          FROM public.orchestrate_task_for_report($1, $2, $3::public.risk_tier_enum)
+        `,
+        [reportId, classification.module, classification.risk_tier],
+      )) as Array<{
+        out_task_id: string | null;
+        out_display_id: string | null;
+        out_status: string | null;
+      }>;
+      const taskId = taskRows[0]?.out_task_id ?? null;
 
       return { report_id: reportId, task_id: taskId };
     });
