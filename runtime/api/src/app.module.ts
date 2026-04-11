@@ -5,6 +5,7 @@ import { DbModule } from './db/db.module';
 import { AgentsModule } from './agents/agents.module';
 import { DbSchemaModule } from './db-schema/db-schema.module';
 import { DeploysModule } from './deploys/deploys.module';
+import { SystemModule } from './system/system.module';
 import { HealthController } from './health/health.controller';
 import { HostReportsModule } from './host-reports/host-reports.module';
 import { ProjectsModule } from './projects/projects.module';
@@ -27,6 +28,7 @@ import { TasksModule } from './tasks/tasks.module';
     DbSchemaModule,
     DeploysModule,
     AgentsModule,
+    SystemModule,
   ],
   controllers: [HealthController],
 })
