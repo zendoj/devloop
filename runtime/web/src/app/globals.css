@@ -1041,3 +1041,22 @@ a.btn {
 a.btn:hover {
   text-decoration: none;
 }
+
+/* Token box for one-time-reveal tokens */
+.token-box {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  background: #0a0d14;
+  color: var(--success);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 10px 12px;
+  word-break: break-all;
+  white-space: pre-wrap;
+  user-select: all;
+  margin: 6px 0 0 0;
+}
+
+.form .input.mono {
+  font-family: var(--font-mono);
+}
