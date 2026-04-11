@@ -5,6 +5,7 @@ import { DbModule } from './db/db.module';
 import { HealthController } from './health/health.controller';
 import { ProjectsModule } from './projects/projects.module';
 import { ReportsModule } from './reports/reports.module';
+import { TasksModule } from './tasks/tasks.module';
 
 /**
  * Root module. Fas 0.9 wires the DB data source, file-backed secrets,
@@ -17,6 +18,7 @@ import { ReportsModule } from './reports/reports.module';
     AuthModule,
     ProjectsModule,
     ReportsModule,
+    TasksModule,
   ],
   controllers: [HealthController],
 })

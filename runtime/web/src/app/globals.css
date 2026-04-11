@@ -1060,3 +1060,54 @@ a.btn:hover {
 .form .input.mono {
   font-family: var(--font-mono);
 }
+
+/* Linkable stat cards */
+.stat-card-link {
+  display: block;
+  color: inherit;
+  text-decoration: none;
+  transition: border-color 0.12s ease, transform 0.12s ease;
+}
+.stat-card-link:hover {
+  border-color: var(--accent);
+  transform: translateY(-1px);
+  text-decoration: none;
+}
+
+/* Fix pill class mismatches from hyphen normalization in Tasks page */
+.pill-queued-for-lock {
+  color: var(--fg-muted);
+  background: rgba(139, 147, 167, 0.08);
+  border-color: rgba(139, 147, 167, 0.3);
+}
+.pill-assigned,
+.pill-in-progress {
+  color: #c078ff;
+  background: rgba(192, 120, 255, 0.08);
+  border-color: rgba(192, 120, 255, 0.3);
+}
+.pill-review,
+.pill-changes-requested {
+  color: #ffb347;
+  background: rgba(255, 179, 71, 0.08);
+  border-color: rgba(255, 179, 71, 0.3);
+}
+.pill-approved,
+.pill-deploying,
+.pill-merged,
+.pill-verifying,
+.pill-verified {
+  color: var(--success);
+  background: rgba(82, 199, 138, 0.08);
+  border-color: rgba(82, 199, 138, 0.3);
+}
+.pill-rolling-back,
+.pill-rolled-back,
+.pill-rollback-failed,
+.pill-failed,
+.pill-cancelled,
+.pill-blocked {
+  color: var(--error);
+  background: rgba(255, 107, 107, 0.08);
+  border-color: rgba(255, 107, 107, 0.3);
+}
