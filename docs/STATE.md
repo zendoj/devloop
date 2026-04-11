@@ -1,8 +1,8 @@
 # DevLoop — Build State
 
-**Last updated:** 2026-04-11
+**Last updated:** 2026-04-11 (late-night session wrap)
 **Current branch:** `main`
-**Status:** Phase 0.9c complete. Central runtime auth is live and reachable at `https://devloop.airpipe.ai`.
+**Status:** Phase 1f complete. The central runtime is live at `https://devloop.airpipe.ai` with: auth (Argon2id + TOTP 2FA), project registration, bug-report intake with a stub orchestrator that auto-creates queued tasks, Overview stats, and sidebar navigation across 8 sections. The actual Claude-based fix execution loop (orchestrator → worker → reviewer → deployer → verification) is **not built yet** — see "What is still a stub" below.
 
 This file tracks *what is built right now*. For the full design see
 [ARCHITECTURE.md](ARCHITECTURE.md); for how to operate it see
@@ -45,7 +45,14 @@ Tech:
 | 0.8 | host_health, host_health_alerts, branch_protection_checks (migration 008) | ✓ | `c71056c` | gpt-5.4 medium, 2 rounds → approved |
 | 0.9a | Argon2id passwords + DB-backed sessions + login/logout (migrations 009-010) | ✓ | `3d04612` | gpt-5.4 medium, 2 rounds → approved |
 | 0.9b | TOTP 2FA + AES-256-GCM data encryption + HKDF challenge tokens (migration 011) | ✓ | `cdec99a` | gpt-5.4 medium, 1 round → approved |
-| 0.9c | Bootstrap admin CLI + Next.js login frontend + Nginx vhost + systemd | ✓ | (`04d0162` port fix + latest HEAD) | gpt-5.4 medium, 1 round → fixes applied |
+| 0.9c | Bootstrap admin CLI + Next.js login frontend + Nginx vhost + systemd | ✓ | `04d0162` | gpt-5.4 medium, 1 round → fixes applied |
+| 1a | App shell (sidebar nav, user badge, stub pages for all sections) | ✓ | (commit after 0.9c) | — (UI only) |
+| 1b | `GET /api/projects` list + real data Projects page | ✓ | `6e3cba4` | — |
+| 1c | Reports intake: migration 012 + /api/reports + /reports list/new/detail UI + thread + stub orchestrator (migration 012) | ✓ | (Fas 1c commit) | gpt-5.4 medium, 1 round → critical race fix |
+| 1d | Project register form + /api/projects (POST) + /projects/:slug detail, host/deploy tokens minted with HMAC and returned once | ✓ | (Fas 1d commit) | — (in Fas 1 bundle review) |
+| 1e | Stub orchestrator `orchestrate_task_for_report` (migration 012) + race fix `idx_agent_tasks_display_id_per_project` + advisory lock (migration 014) | ✓ | `4692ae9` | gpt-5.4 flagged race, fixed |
+| 1f | Tasks page with real queue + Overview stats endpoint (`/api/overview/stats`) | ✓ | `9b60a14` | — |
+| Fas 1 polish | addThread atomic FK→404, `new URL()` host_base_url parse, shared slug validator | ✓ | `efcb9a9` | gpt-5.4 round 2 → approved |
 
 Architecture doc: `docs/ARCHITECTURE.md` v10 (committed `45e9d7b` during
 bootstrap of the phased build, reviewed through 10 rounds with
@@ -70,15 +77,36 @@ Start/stop/status commands are in [RUNBOOK.md](RUNBOOK.md#service-management).
 
 ```
 https://devloop.airpipe.ai/
-  ├── /healthz                  → API   (GET,  anonymous, returns {ok:true})
-  ├── /auth/login                → API   (POST, email+password)
-  ├── /auth/2fa/verify           → API   (POST, challenge+code)
-  ├── /auth/2fa/enroll           → API   (POST, guarded)
-  ├── /auth/2fa/confirm          → API   (POST, guarded)
-  ├── /auth/logout               → API   (POST, guarded)
-  ├── /auth/me                   → API   (POST, guarded)
-  ├── /login                     → Next  (client component, login form)
-  └── /                          → Next  (server component dashboard; redirects to /login if unauthenticated)
+
+AUTH
+  /healthz                             (GET,  anonymous)
+  /auth/login                          (POST, email+password)
+  /auth/2fa/verify                     (POST, challenge+code)
+  /auth/2fa/enroll                     (POST, guarded)
+  /auth/2fa/confirm                    (POST, guarded)
+  /auth/logout                         (POST, guarded)
+  /auth/me                             (POST, guarded)
+
+API (all guarded, admin+super_admin only)
+  /api/overview/stats                  (GET)
+  /api/projects                        (GET list, POST create)
+  /api/projects/:slug                  (GET detail)
+  /api/reports                         (GET list, POST create)
+  /api/reports/:id                     (GET detail with thread)
+  /api/reports/:id/threads             (POST add comment)
+  /api/tasks                           (GET list)
+
+WEB (Next.js Server Components unless noted)
+  /login                               (client component)
+  /                                    Overview dashboard
+  /projects                            Projects list
+  /projects/new                        Register project form
+  /projects/:slug                      Project detail
+  /reports                             Reports list
+  /reports/new                         File bug report form
+  /reports/:id                         Report detail + thread
+  /tasks                               Tasks queue
+  /deploys, /health, /audit, /settings Stub pages (phase-tagged)
 ```
 
 ### Database — applied migrations
@@ -102,6 +130,11 @@ https://devloop.airpipe.ai/
 009_session_token_hash              sessions.token_hash (SHA-256 lookup)
 010_auth_runtime_grants             column-level UPDATE grants on users for login path
 011_two_factor_grants               column-level UPDATE grants for 2FA fields
+012_reports                         reports, report_threads, report_artifacts,
+                                    agent_tasks.report_id FK, orchestrate_task_for_report
+013_projects_insert_grant           GRANT INSERT on projects to devloop_api
+014_orchestrator_race_fix           UNIQUE (project_id, display_id) on agent_tasks +
+                                    advisory lock in orchestrate_task_for_report
 ```
 
 Verify with: `sudo -u devloop-admin env DEVLOOP_DB_USER=devloop_owner \
@@ -148,84 +181,129 @@ already bound by the FMS instance.
 
 ---
 
-## How to run the test accounts
+## Accounts right now
 
-There is one password-only test user (for smoke tests and the
-initial end-to-end curl flow):
+Two users live in the database:
 
-```
-email:    fas09-runtime@example.com
-password: runtime-path-pwd-1234
-2FA:      not enrolled
-role:     admin
-```
+| email | role | 2FA | purpose |
+|---|---|---|---|
+| `admin@devloop.airpipe.ai` | admin | enrolled | Jonas's real account. Log in here. |
+| `fas09-runtime@example.com` | admin | not enrolled | Smoke-test backup (password: `runtime-path-pwd-1234`). Bypasses 2FA. Keep for debugging. |
 
-There is one 2FA-enrolled smoke test user that is deleted/recreated
-by the smoke suite on every run (`fas09b-2fa@example.com`), so do
-not rely on it between runs.
+And one registered project:
 
-To create your own real admin account (interactive, with QR code):
+| slug | name | repo | branch |
+|---|---|---|---|
+| `dev-energicrm` | Dev Energicrm | zendoj/energicrm | experiment2 |
+
+No reports or tasks at the moment. The stats on the Overview page
+will show Projects=1, Open reports=0, Active tasks=0, Deploys(7d)=0.
+
+### Creating additional admin accounts
+
+Interactive (recommended — you scan the QR in a TOTP app):
 
 ```bash
 sudo -u devloop-admin env DEVLOOP_DB_USER=devloop_owner \
   bash -c 'cd /opt/devloop/runtime/api && npx ts-node scripts/bootstrap-admin.ts'
 ```
 
-The script will prompt for email, role, password (silent), and then
-render a QR code to the terminal. Scan it into any TOTP app, confirm
-the 6-digit code, and the account is enrolled.
+Non-interactive (env vars, secret printed to stdout as QR + base32):
+
+```bash
+sudo -u devloop-admin env \
+  DEVLOOP_DB_USER=devloop_owner \
+  BOOTSTRAP_EMAIL=you@example.com \
+  BOOTSTRAP_ROLE=admin \
+  BOOTSTRAP_PASSWORD='your-strong-password' \
+  bash -c 'cd /opt/devloop/runtime/api && npx ts-node scripts/bootstrap-admin-noninteractive.ts'
+```
+
+---
+
+## What is still a stub (important to read before demoing)
+
+The end-to-end **"file a bug and have DevLoop fix it"** loop is
+NOT complete. What exists:
+
+✅ **The intake + triage half:** A report is filed via
+`POST /api/reports`, the stub orchestrator `orchestrate_task_for_report`
+inserts a paired `agent_tasks` row in `queued_for_lock`, the report
+transitions `new → triaged`, audit events fire for both state
+changes. The task is visible in `/tasks`.
+
+❌ **The fix + deploy half:** Nothing advances a task out of
+`queued_for_lock`. Specifically missing:
+
+1. **Module classification.** The stub orchestrator hardcodes
+   `module='unknown'` and `risk_tier='standard'`. A real classifier
+   should read the project_config's classifier_rules, map the
+   report text to a module path, and assign a risk tier. See
+   ARCHITECTURE §6.
+2. **Worker manager.** Nothing polls `agent_tasks WHERE status IN
+   ('assigned', 'queued_for_lock')` and calls `claim_assigned_task`.
+3. **Worker runtime.** No process spawns Claude in a bwrap
+   sandbox, clones the repo, runs the fix, and commits a branch.
+   Needs Anthropic API key provisioning and the sandbox infra
+   that ARCHITECTURE §4.3 / §8 describes.
+4. **Reviewer.** No process calls OpenAI to review the diff and
+   invoke `fence_and_transition` with a review decision.
+5. **Deployer.** No process signs a desired state row via
+   `record_desired_state` and pushes the branch + PR to GitHub.
+6. **Host deploy agent.** No agent on any real host is polling
+   `desired_state_history` and calling `record_apply_*`.
+7. **Verification scanner.** Nothing calls
+   `record_host_health_probe` / `record_apply_timeout`.
+
+All of this is **weeks of work**. The DB schema, stored
+procedures, and RBAC matrix for every piece above already exist
+and are verified — what's missing is the actual process code that
+calls into them. See ARCHITECTURE §3.1.2 for the full service
+inventory.
 
 ---
 
 ## What is next
 
-Roughly, in order of decreasing obviousness:
+Ordered by what it unlocks:
 
-1. **Phase 1 — Reports intake and task creation.** First real
-   business logic: the `reports`, `report_threads`, `report_artifacts`
-   tables + POST /reports intake endpoint + orchestrator placeholder
-   that promotes a report to an `agent_tasks` row. This is where
-   ARCHITECTURE §6 starts to come alive.
+1. **Run the full loop manually.** A DBA can manually walk a task
+   through the state machine via psql + the existing procedures to
+   demo the end state before any worker exists. Useful as a
+   integration-test anchor.
 
-2. **Frontend dashboard content.** The current `/` page is a
-   placeholder. Fas 1+ will add: projects list, task board, report
-   triage, deploy history, audit search.
+2. **Classifier.** Replace the stubbed `module='unknown'` with a
+   real classifier call (can be a simple regex map in Fas 2, then
+   GPT-based later).
 
-3. **Remaining runtime DB roles.** `devloop_orch`, `devloop_rev`,
-   `devloop_dep`, `devloop_wm` + their OS users + `pg_ident.conf`
-   entries. Matches the RBAC matrix in ARCHITECTURE §19 D26.
+3. **Worker manager skeleton + worker runtime.** The biggest piece.
+   Needs the sandbox infra + Anthropic API key wiring.
 
-4. **Worker manager skeleton.** The `claim_assigned_task` stored
-   procedure already exists; there is no process yet that calls it.
+4. **Reviewer worker.** Simpler — it calls OpenAI on the diff.
+   Needs `/etc/devloop/openai_api_key` provisioned.
 
-5. **Reviewer worker skeleton.** Same shape: reviews tasks, calls
-   `fence_and_transition` with review decisions. Needs OpenAI key
-   provisioning at `/etc/devloop/openai_api_key`.
+5. **Deployer.** Writes desired state + opens PR. Needs GitHub App
+   credentials at `/etc/devloop/github_app_key` and the deploy
+   signing private key.
 
-6. **Deployer worker + host deploy agent protocol.** The
-   `record_desired_state` / `record_apply_*` procs already exist
-   and are verified; the deployer process that actually signs +
-   writes desired state rows is not built yet. Needs signing key
-   provisioning under `/etc/devloop/deploy_signing_priv_<key_id>`
-   + `deploy_signing_active_key_id`.
+6. **Host deploy agent.** Runs on each managed host, polls central,
+   applies, reports status.
 
-7. **Host health monitor + compliance scanner.** Tables + procs
-   exist (migration 008). Scheduler processes that actually call
-   `record_host_health_probe` and `record_branch_protection_check`
-   are not built yet.
+7. **Remaining DB roles.** `devloop_orch`, `devloop_rev`,
+   `devloop_dep`, `devloop_wm` get their own PG roles + OS users +
+   pg_ident mappings, matching ARCHITECTURE §19 D26. Done when
+   each of those workers ships.
 
-8. **Push to origin.** The local branch is several commits ahead of
-   `origin/main`. The environment this work was done in has no
-   GitHub credentials; someone with push access needs to run
+8. **Push to origin.** The local branch is many commits ahead of
+   `origin/main`. The environment this work runs in has no GitHub
+   credentials — someone with push access needs to run
    `cd /opt/devloop && git push origin main`.
 
-9. **Proper Let's Encrypt cert for devloop.airpipe.ai.** Current
-   cert is self-signed and only works because Cloudflare terminates
-   TLS in front. If CF is ever bypassed or put in "strict" mode,
-   this breaks. See RUNBOOK.md §"Certificates".
+9. **Let's Encrypt cert for devloop.airpipe.ai.** Self-signed
+   today, works because Cloudflare terminates TLS. Swap to LE once
+   we move away from CF "Full" mode. See RUNBOOK.md §Certificates.
 
 10. **OpenAI key rotation.** The key in
     `/opt/dev_energicrm/backend/.env` was exposed in chat on
     2026-04-10 ~21:15 UTC and must be rotated within 24 hours.
-    See the tracking entry in
-    `~/.claude/projects/-opt-dev-energicrm/memory/rotate_openai_key_pending.md`.
+    Entry: `~/.claude/projects/-opt-dev-energicrm/memory/rotate_openai_key_pending.md`.
