@@ -232,6 +232,14 @@ export async function callAgent(
 const WEBENGINE_MAX_CONCURRENT = 2;
 const WEBENGINE_MIN_DELAY_MS = 15_000;
 const WEBENGINE_COOLDOWN_MS = 10 * 60 * 1000;
+// Webengine allows 5-120 as autoDeleteMinutes on /ask submits.
+// We set it to the minimum on every call so each conversation
+// is garbage-collected 5 minutes after the response lands. DevLoop
+// never re-opens a conversation (we run stateless per request),
+// so there's nothing to lose by having the upstream tidy up.
+// Without this, ChatGPT accumulates one session per agent call
+// and drowns in "2000 chats".
+const WEBENGINE_AUTO_DELETE_MINUTES = 5;
 
 let webengineActive = 0;
 const webengineWaiters: Array<() => void> = [];
@@ -329,6 +337,9 @@ async function callWebengine(
     form.set('prompt', prompt);
     form.set('model', model);
     form.set('saveFile', 'true');
+    // Request upstream auto-delete of the conversation 5 minutes
+    // after the response arrives — see WEBENGINE_AUTO_DELETE_MINUTES.
+    form.set('autoDeleteMinutes', String(WEBENGINE_AUTO_DELETE_MINUTES));
     if (conversationRef) form.set('conversationId', conversationRef);
     for (const f of files) {
       const blob =
@@ -345,7 +356,11 @@ async function callWebengine(
       body: form,
     });
   } else {
-    const submitBody: Record<string, unknown> = { prompt, model };
+    const submitBody: Record<string, unknown> = {
+      prompt,
+      model,
+      autoDeleteMinutes: WEBENGINE_AUTO_DELETE_MINUTES,
+    };
     if (conversationRef) submitBody.conversationId = conversationRef;
     submitRes = await fetch(askPath, {
       method: 'POST',
