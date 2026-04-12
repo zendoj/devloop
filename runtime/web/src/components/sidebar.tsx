@@ -21,6 +21,7 @@ const NAV: NavItem[] = [
   { href: '/audit', label: 'Audit', icon: '❐', phase: 'Fas 4' },
   { href: '/agents', label: 'Agents', icon: '◈', phase: 'Fas F1' },
   { href: '/db-schema', label: 'DB Schema', icon: '▥', phase: 'Fas E' },
+  { href: '/users', label: 'Users', icon: '◎', phase: 'Auth' },
   { href: '/settings', label: 'Settings', icon: '◉', phase: 'Fas 5' },
 ];
 

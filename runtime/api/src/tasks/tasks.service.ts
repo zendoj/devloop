@@ -345,16 +345,44 @@ export class TasksService {
   }
 
   /**
+   * Look up a task by display_id + project_id. Used by the
+   * host-auth'd reject endpoint which only knows the display_id
+   * (T-9) from the widget and the project_id from the host
+   * token.
+   */
+  public async findByDisplayId(
+    projectId: string,
+    displayId: string,
+  ): Promise<{ id: string; status: string } | null> {
+    const rows = (await this.ds.query(
+      `SELECT id::text AS id, status::text AS status
+         FROM public.agent_tasks
+        WHERE project_id = $1
+          AND display_id = $2
+        LIMIT 1`,
+      [projectId, displayId],
+    )) as Array<{ id: string; status: string }>;
+    return rows[0] ?? null;
+  }
+
+  /**
    * Reject a task with feedback. Saves the feedback + files to
    * task_feedback and transitions ready_for_test → assigned so
    * Claude runs the task again with the feedback files copied
    * into the worktree on next worker spawn.
+   *
+   * userId may be null for host-auth'd rejects coming from the
+   * CRM widget (no DevLoop user in that flow). actorName
+   * controls the fence_and_transition actor string — defaults
+   * to `user:${userId}` for the cookie-auth path, callers can
+   * override to `host:${project_slug}` etc.
    */
   public async reject(
     id: string,
-    userId: string,
+    userId: string | null,
     feedbackText: string,
     files: Array<{ name: string; content: string; size: number }>,
+    actorName?: string,
   ): Promise<void> {
     if (!feedbackText || feedbackText.trim().length === 0) {
       throw new Error('feedback_text required');
@@ -396,6 +424,8 @@ export class TasksService {
 
       // Transition ready_for_test → assigned. fence_and_transition
       // increments retry_count and keeps the module lock held.
+      const resolvedActor =
+        actorName ?? (userId ? `user:${userId}` : 'user:unknown');
       await m.query(
         `
         SELECT public.fence_and_transition(
@@ -409,11 +439,59 @@ export class TasksService {
         [
           id,
           Number(current.lease_version),
-          `user:${userId}`,
+          resolvedActor,
           `human rejected with feedback (attempt ${attemptNumber})`,
         ],
       );
     });
+  }
+
+  /**
+   * Manually recover a stuck task. Used when a task is in a
+   * dead-end state (typically rollback_failed or failed) and an
+   * operator has inspected the production host, confirmed the
+   * state is sane, and wants to un-stuck the pipeline.
+   *
+   * Wraps the `recover_task` SQL proc which atomically:
+   *   - releases deploy_mutex for this task
+   *   - releases module_lock for this task
+   *   - transitions to the target status
+   *   - appends an audit_event row
+   *
+   * The caller's role is checked: only admin/super_admin can
+   * trigger recovery.
+   */
+  public async recover(
+    id: string,
+    callerRole: string,
+    callerUserId: string,
+    targetStatus: string,
+    reason: string,
+  ): Promise<{ new_lease: number }> {
+    if (callerRole !== 'admin' && callerRole !== 'super_admin') {
+      throw new Error('only admin can recover tasks');
+    }
+    const allowed = new Set([
+      'ready_for_test',
+      'assigned',
+      'failed',
+      'cancelled',
+    ]);
+    if (!allowed.has(targetStatus)) {
+      throw new Error(
+        `illegal target status '${targetStatus}' (allowed: ${[...allowed].join(', ')})`,
+      );
+    }
+    const trimmedReason = reason.trim().slice(0, 500);
+    if (trimmedReason.length === 0) {
+      throw new Error('reason is required');
+    }
+    const rows = (await this.ds.query(
+      `SELECT public.recover_task($1::uuid, $2::public.task_status_enum, $3::varchar(128), $4::text) AS new_lease`,
+      [id, targetStatus, `user:${callerUserId}`, trimmedReason],
+    )) as Array<{ new_lease: string | number }>;
+    const newLease = Number(rows[0]?.new_lease ?? 0);
+    return { new_lease: newLease };
   }
 }
 

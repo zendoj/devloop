@@ -35,6 +35,11 @@ interface ThreadBody {
   body: string;
 }
 
+interface RecoverBody {
+  target_status: string;
+  reason: string;
+}
+
 @Controller('api')
 @UseGuards(SessionGuard)
 export class TasksController {
@@ -165,5 +170,45 @@ export class TasksController {
     const session = req.session;
     if (!session) throw new UnauthorizedException('unauthorized');
     return this.tasks.stats(session.role);
+  }
+
+  /**
+   * Admin-only manual recovery. Used when a task is stuck in
+   * rollback_failed, failed, or any other dead-end state and the
+   * operator has confirmed production is sane. Atomically releases
+   * deploy_mutex + module_lock and transitions to one of:
+   * ready_for_test, assigned, failed, cancelled.
+   */
+  @Post('admin/tasks/:id/recover')
+  @HttpCode(HttpStatus.OK)
+  public async recover(
+    @Req() req: RequestWithSession,
+    @Param('id') id: string,
+    @Body() body: RecoverBody,
+  ): Promise<{ ok: true; new_lease: number }> {
+    const session = req.session;
+    if (!session) throw new UnauthorizedException('unauthorized');
+    if (!/^[0-9a-f-]{36}$/i.test(id)) {
+      throw new BadRequestException('invalid id');
+    }
+    if (
+      !body ||
+      typeof body.target_status !== 'string' ||
+      typeof body.reason !== 'string'
+    ) {
+      throw new BadRequestException('target_status + reason required');
+    }
+    try {
+      const { new_lease } = await this.tasks.recover(
+        id,
+        session.role,
+        session.userId,
+        body.target_status,
+        body.reason,
+      );
+      return { ok: true, new_lease };
+    } catch (err) {
+      throw new BadRequestException((err as Error).message);
+    }
   }
 }

@@ -3,7 +3,7 @@ import 'reflect-metadata';
 import { readFileSync } from 'node:fs';
 import { DataSource } from 'typeorm';
 import { buildDataSource } from '../data-source';
-import { callAgent } from '../agents/call-agent';
+import { callAgent, parseAgentJson } from '../agents/call-agent';
 
 /**
  * DevLoop Reviewer (Fas 4).
@@ -659,7 +659,8 @@ async function askModel(
   ]);
 
   // Parse the reviewer verdict first — that's the core gate.
-  const stripped = stripJsonFence(reviewerResult.text);
+  // parseAgentJson handles both ```json fences and the case where
+  // webengine prepends a "thinking" sentence before the JSON.
   let parsed: {
     decision?: unknown;
     score?: unknown;
@@ -671,11 +672,9 @@ async function askModel(
     plan_adherence?: unknown;
   };
   try {
-    parsed = JSON.parse(stripped);
+    parsed = parseAgentJson(reviewerResult.text) as typeof parsed;
   } catch (err) {
-    throw new Error(
-      `failed to parse reviewer JSON: ${String(err)}; first 200 bytes: ${stripped.slice(0, 200)}`,
-    );
+    throw new Error(`failed to parse reviewer JSON: ${(err as Error).message}`);
   }
   let rawDecision = parsed.decision;
   if (rawDecision === 'needs_changes' || rawDecision === 'requested_changes') {
@@ -707,7 +706,7 @@ async function askModel(
   let auditNotesMd: string | null = null;
   if (auditorResult.ok) {
     try {
-      const auditJson = JSON.parse(stripJsonFence(auditorResult.text)) as {
+      const auditJson = parseAgentJson(auditorResult.text) as {
         security_status?: string;
         notes_md?: string;
       };
@@ -873,13 +872,6 @@ async function fetchFileAtSha(
  */
 function sanitizeAttachmentName(p: string): string {
   return p.replace(/[^a-zA-Z0-9._-]/g, '_').replace(/^\.+/, '');
-}
-
-function stripJsonFence(s: string): string {
-  const trimmed = s.trim();
-  const fence = trimmed.match(/^```(?:json)?\s*\n?([\s\S]*?)\n?```$/);
-  if (fence && fence[1]) return fence[1].trim();
-  return trimmed;
 }
 
 function sleep(ms: number): Promise<void> {

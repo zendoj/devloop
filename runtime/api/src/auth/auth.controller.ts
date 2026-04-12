@@ -1,6 +1,9 @@
 import {
+  BadRequestException,
   Body,
   Controller,
+  ForbiddenException,
+  Get,
   HttpCode,
   HttpStatus,
   Post,
@@ -108,13 +111,17 @@ export class AuthController {
   @UseGuards(SessionGuard)
   public async enroll2fa(
     @Req() req: RequestWithSession,
-  ): Promise<{ secret: string; otpauth_uri: string }> {
+  ): Promise<{ secret: string; otpauth_uri: string; qr_png_base64: string }> {
     const session = req.session;
     if (!session) {
       throw new UnauthorizedException('unauthorized');
     }
     const result = await this.auth.beginEnroll2fa(session.userId);
-    return { secret: result.secret, otpauth_uri: result.otpauthUri };
+    return {
+      secret: result.secret,
+      otpauth_uri: result.otpauthUri,
+      qr_png_base64: result.qrPngBase64,
+    };
   }
 
   /**
@@ -204,18 +211,126 @@ export class AuthController {
   @UseGuards(SessionGuard)
   public async me(@Req() req: RequestWithSession): Promise<{
     user_id: string;
+    email: string;
     role: string;
     expires_at: string;
+    must_enroll_2fa: boolean;
   }> {
     const session = req.session;
     if (!session) {
       throw new UnauthorizedException('unauthorized');
     }
+    // Check the user's current 2FA state. We read fresh from the
+    // DB (not from the session) so flipping enrolled=true in the
+    // confirm step is visible immediately without re-issuing the
+    // session. `two_factor_required && !two_factor_enrolled` is
+    // the exact "must enroll before using the app" signal the
+    // frontend middleware keys off.
+    const status = await this.auth.getUserAuthStatus(session.userId);
     return {
       user_id: session.userId,
+      email: status.email,
       role: session.role,
       expires_at: session.expiresAt.toISOString(),
+      must_enroll_2fa: status.mustEnroll2fa,
     };
+  }
+
+  /**
+   * GET /auth/users — admin-only user listing. Used by the admin
+   * user-management page. Returns email + role + enrollment state
+   * + last-login timestamp. Password hashes are NEVER returned.
+   */
+  @Get('users')
+  @HttpCode(HttpStatus.OK)
+  @UseGuards(SessionGuard)
+  public async listUsers(@Req() req: RequestWithSession): Promise<{
+    users: Array<{
+      id: string;
+      email: string;
+      role: string;
+      two_factor_enrolled: boolean;
+      last_login_at: string | null;
+      created_at: string;
+    }>;
+  }> {
+    const session = req.session;
+    if (!session) {
+      throw new UnauthorizedException('unauthorized');
+    }
+    if (session.role !== 'admin' && session.role !== 'super_admin') {
+      throw new ForbiddenException('admin only');
+    }
+    const users = await this.auth.listUsers();
+    return { users };
+  }
+
+  /**
+   * POST /auth/users — admin-only user creation. Caller supplies
+   * email + password + role; password is hashed server-side with
+   * the same argon2id parameters as the existing users. The new
+   * user gets two_factor_required=true so they hit the enrollment
+   * flow on first login.
+   */
+  @Post('users')
+  @HttpCode(HttpStatus.CREATED)
+  @UseGuards(SessionGuard)
+  @UsePipes(
+    new ValidationPipe({
+      transform: true,
+      whitelist: true,
+      forbidNonWhitelisted: true,
+      forbidUnknownValues: true,
+    }),
+  )
+  public async createUser(
+    @Req() req: RequestWithSession,
+    @Body() body: { email: string; password: string; role: string },
+  ): Promise<{ id: string; email: string; role: string }> {
+    const session = req.session;
+    if (!session) {
+      throw new UnauthorizedException('unauthorized');
+    }
+    if (session.role !== 'admin' && session.role !== 'super_admin') {
+      throw new ForbiddenException('admin only');
+    }
+    if (
+      typeof body.email !== 'string' ||
+      typeof body.password !== 'string' ||
+      typeof body.role !== 'string'
+    ) {
+      throw new BadRequestException('email + password + role required');
+    }
+    const email = body.email.trim().toLowerCase();
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+      throw new BadRequestException('invalid email');
+    }
+    if (body.password.length < 12) {
+      throw new BadRequestException('password must be at least 12 chars');
+    }
+    const allowedRoles = new Set(['viewer', 'admin', 'super_admin']);
+    if (!allowedRoles.has(body.role)) {
+      throw new BadRequestException(
+        `invalid role (allowed: ${[...allowedRoles].join(', ')})`,
+      );
+    }
+    // super_admin role can only be assigned by an existing super_admin.
+    if (body.role === 'super_admin' && session.role !== 'super_admin') {
+      throw new ForbiddenException(
+        'only super_admin can create another super_admin',
+      );
+    }
+    try {
+      const created = await this.auth.createUser(
+        email,
+        body.password,
+        body.role,
+        session.userId,
+      );
+      return created;
+    } catch (err) {
+      throw new BadRequestException((err as Error).message);
+    }
   }
 }
 

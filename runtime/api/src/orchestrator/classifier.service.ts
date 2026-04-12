@@ -1,7 +1,7 @@
 import { Inject, Injectable, Logger } from '@nestjs/common';
 import { DataSource } from 'typeorm';
 import { DATA_SOURCE } from '../db/db.module';
-import { callAgent } from '../agents/call-agent';
+import { callAgent, parseAgentJson } from '../agents/call-agent';
 
 /**
  * Shape of the classifier_rules JSONB column on project_configs.
@@ -195,13 +195,15 @@ of the listed modules — prefer a best-effort guess.`;
       return null;
     }
 
-    const stripped = stripJsonFence(result.text);
     let parsed: { module?: unknown; risk_tier?: unknown };
     try {
-      parsed = JSON.parse(stripped);
-    } catch {
+      parsed = parseAgentJson(result.text) as {
+        module?: unknown;
+        risk_tier?: unknown;
+      };
+    } catch (err) {
       this.logger.warn(
-        `classifier returned non-JSON: ${stripped.slice(0, 200)}`,
+        `classifier returned non-JSON: ${(err as Error).message}`,
       );
       return null;
     }
@@ -323,11 +325,4 @@ of the listed modules — prefer a best-effort guess.`;
       default_risk_tier: defaultRiskTier,
     };
   }
-}
-
-function stripJsonFence(s: string): string {
-  const trimmed = s.trim();
-  const fence = trimmed.match(/^```(?:json)?\s*\n?([\s\S]*?)\n?```$/);
-  if (fence && fence[1]) return fence[1].trim();
-  return trimmed;
 }

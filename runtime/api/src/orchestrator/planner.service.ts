@@ -2,7 +2,7 @@
 import { Inject, Injectable, Logger } from '@nestjs/common';
 import { DataSource } from 'typeorm';
 import { DATA_SOURCE } from '../db/db.module';
-import { callAgent, stripJsonFence } from '../agents/call-agent';
+import { callAgent, parseAgentJson } from '../agents/call-agent';
 
 /**
  * PlannerService — runs the `planner` agent role (best-effort)
@@ -160,14 +160,17 @@ async function planImpl(
     return null;
   }
 
-  const stripped = stripJsonFence(result.text);
+  // parseAgentJson handles both the ```json fence case and the
+  // "webengine prepended a thinking sentence" case that bit T-9 —
+  // falls through to extractFirstJsonObject when direct parse fails.
   let parsed: { notes_md?: unknown; summary?: unknown };
   try {
-    parsed = JSON.parse(stripped);
-  } catch {
-    warn(
-      `planner returned non-JSON for task ${taskId}: ${stripped.slice(0, 200)}`,
-    );
+    parsed = parseAgentJson(result.text) as {
+      notes_md?: unknown;
+      summary?: unknown;
+    };
+  } catch (err) {
+    warn(`planner returned non-JSON for task ${taskId}: ${(err as Error).message}`);
     return null;
   }
 

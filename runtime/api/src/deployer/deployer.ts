@@ -4,7 +4,7 @@ import { createPrivateKey, sign as cryptoSign } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import { DataSource } from 'typeorm';
 import { buildDataSource } from '../data-source';
-import { callAgent, stripJsonFence } from '../agents/call-agent';
+import { callAgent, parseAgentJson } from '../agents/call-agent';
 import { jcs } from './jcs';
 
 /**
@@ -870,13 +870,15 @@ async function summarizePr(
     return null;
   }
 
-  const stripped = stripJsonFence(result.text);
   let parsed: { pr_title?: unknown; pr_body_md?: unknown };
   try {
-    parsed = JSON.parse(stripped);
-  } catch {
+    parsed = parseAgentJson(result.text) as {
+      pr_title?: unknown;
+      pr_body_md?: unknown;
+    };
+  } catch (err) {
     console.warn(
-      `[dp] ${t.display_id} summarizer returned non-JSON: ${stripped.slice(0, 200)}`,
+      `[dp] ${t.display_id} summarizer returned non-JSON: ${(err as Error).message}`,
     );
     return null;
   }

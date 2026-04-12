@@ -6,8 +6,10 @@ import UserBadge from '@/components/user-badge';
 
 interface Me {
   user_id: string;
+  email: string;
   role: string;
   expires_at: string;
+  must_enroll_2fa: boolean;
 }
 
 async function fetchMe(): Promise<Me | null> {
@@ -30,6 +32,10 @@ async function fetchMe(): Promise<Me | null> {
  * authenticated shell (sidebar + header). The auth check runs here
  * in the layout so each page component can assume it has a valid
  * session and user context without redoing the /auth/me call.
+ *
+ * Also enforces 2FA enrollment: if the user has two_factor_required
+ * but !two_factor_enrolled, we force them to /enroll-2fa before
+ * they can see any app content.
  */
 export default async function AppLayout({
   children,
@@ -39,6 +45,9 @@ export default async function AppLayout({
   const me = await fetchMe();
   if (!me) {
     redirect('/login');
+  }
+  if (me.must_enroll_2fa) {
+    redirect('/enroll-2fa');
   }
 
   return (

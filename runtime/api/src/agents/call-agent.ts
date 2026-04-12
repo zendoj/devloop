@@ -626,3 +626,86 @@ export function stripJsonFence(s: string): string {
   if (fence && fence[1]) return fence[1].trim();
   return trimmed;
 }
+
+/**
+ * Find the first balanced top-level JSON object `{…}` in a string
+ * and return it. Returns null if there's no `{` or no matching `}`.
+ *
+ * Why this exists: webengine agents occasionally prepend a "thinking"
+ * sentence before the JSON payload even when told not to, e.g.:
+ *
+ *   "Läser instruktionen och buggrapporten, sedan…
+ *   {\"summary\":\"…\",\"steps\":[…]}"
+ *
+ * stripJsonFence() only handles triple-backtick fences and leaves
+ * leading prose intact, so `JSON.parse` fails on the first word.
+ * This walker is string-aware (ignores braces inside "…"-strings
+ * with backslash escapes) so it doesn't get tripped up by `"}"`
+ * inside a value.
+ *
+ * We return the raw substring so the caller can feed it straight
+ * into JSON.parse — that way a genuinely malformed object still
+ * produces a proper SyntaxError the caller can log.
+ */
+/**
+ * Parse an agent's text reply as JSON, leniently. Runs through
+ * stripJsonFence first (handles ```json ... ``` wrappers), tries
+ * a direct JSON.parse, and if that fails falls back to
+ * extractFirstJsonObject (handles prose-before-JSON).
+ *
+ * Throws a descriptive Error on total failure — callers should
+ * wrap in try/catch and log the reason. The thrown message
+ * contains a short head of the raw text so the operator can see
+ * what the model actually emitted.
+ */
+export function parseAgentJson(text: string): unknown {
+  const stripped = stripJsonFence(text);
+  try {
+    return JSON.parse(stripped);
+  } catch {
+    const extracted = extractFirstJsonObject(stripped);
+    if (!extracted) {
+      throw new Error(
+        `no JSON object found in agent reply; head: ${stripped.slice(0, 200)}`,
+      );
+    }
+    try {
+      return JSON.parse(extracted);
+    } catch (err) {
+      throw new Error(
+        `agent reply contained unparseable JSON object: ${(err as Error).message}; head: ${stripped.slice(0, 200)}`,
+      );
+    }
+  }
+}
+
+export function extractFirstJsonObject(s: string): string | null {
+  const start = s.indexOf('{');
+  if (start < 0) return null;
+  let depth = 0;
+  let inString = false;
+  let escaped = false;
+  for (let i = start; i < s.length; i++) {
+    const ch = s[i];
+    if (inString) {
+      if (escaped) {
+        escaped = false;
+      } else if (ch === '\\') {
+        escaped = true;
+      } else if (ch === '"') {
+        inString = false;
+      }
+      continue;
+    }
+    if (ch === '"') {
+      inString = true;
+      continue;
+    }
+    if (ch === '{') depth++;
+    else if (ch === '}') {
+      depth--;
+      if (depth === 0) return s.slice(start, i + 1);
+    }
+  }
+  return null;
+}

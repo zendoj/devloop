@@ -30,16 +30,17 @@ export interface SessionContext {
 export class SessionService {
   private readonly logger = new Logger(SessionService.name);
 
-  // 30 days. Matches common session cookie lifetimes for internal tools
-  // and is long enough that operators do not re-login constantly while
-  // short enough that a stolen cookie has a bounded window. Revocation
-  // is always available via logout or admin action.
-  private readonly SESSION_TTL_MS = 30 * 24 * 60 * 60 * 1000;
+  // 24 hours. Per operator request: every session expires one day
+  // after issue and requires a fresh password + 2FA to continue.
+  // Short enough that a stolen cookie has a tight window, long
+  // enough for a single working day.
+  private readonly SESSION_TTL_MS = 24 * 60 * 60 * 1000;
 
-  // Idle timeout: a session that has not been used in 14 days is treated
-  // as stale even if its expires_at has not been reached. This is a
-  // separate guardrail from the absolute TTL.
-  private readonly IDLE_TIMEOUT_MS = 14 * 24 * 60 * 60 * 1000;
+  // Idle timeout equals the absolute TTL — there is no separate
+  // idle window shorter than the TTL. Keeping this explicit so a
+  // future change that lengthens SESSION_TTL_MS must decide what
+  // to do about idle independently.
+  private readonly IDLE_TIMEOUT_MS = 24 * 60 * 60 * 1000;
 
   constructor(@Inject(DATA_SOURCE) private readonly ds: DataSource) {}
 

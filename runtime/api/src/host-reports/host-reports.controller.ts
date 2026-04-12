@@ -13,6 +13,7 @@ import {
 } from '@nestjs/common';
 import { FastifyRequest } from 'fastify';
 import { ReportsService } from '../reports/reports.service';
+import { TasksService } from '../tasks/tasks.service';
 import { HostReportDto } from './dtos/host-report.dto';
 import { HostAuthGuard, HostContext } from './host-auth.guard';
 
@@ -46,7 +47,10 @@ interface RequestWithHost extends FastifyRequest {
   }),
 )
 export class HostReportsController {
-  constructor(private readonly reports: ReportsService) {}
+  constructor(
+    private readonly reports: ReportsService,
+    private readonly tasks: TasksService,
+  ) {}
 
   @Post()
   @HttpCode(HttpStatus.CREATED)
@@ -121,5 +125,95 @@ export class HostReportsController {
       }
       throw err;
     }
+  }
+
+  /**
+   * Host-auth'd "not working" reject flow — the CRM widget's
+   * Ctrl+Shift+D panel has an "X not working" checkbox that
+   * routes submissions here instead of creating a new report.
+   * Looks up the task by display_id within the project the
+   * host token belongs to, then drives the same reject path
+   * as the cookie-auth'd /api/tasks/:id/reject endpoint:
+   * feedback + optional files → task_feedback → fence back to
+   * assigned → worker re-runs Claude with the rejection files
+   * in .devloop/feedback/attempt-N/.
+   *
+   * Only tasks currently in 'ready_for_test' can be rejected
+   * this way. Attempting to reject a task in any other status
+   * surfaces a 400.
+   */
+  @Post('reject')
+  @HttpCode(HttpStatus.OK)
+  public async reject(
+    @Body()
+    body: {
+      task_display_id?: unknown;
+      feedback?: unknown;
+      files?: Array<{ name?: unknown; content_base64?: unknown }>;
+    },
+    @Req() req: RequestWithHost,
+  ): Promise<{ ok: true; task_id: string }> {
+    const host = req.devloopHost;
+    if (!host) {
+      throw new UnauthorizedException('unauthorized');
+    }
+    if (typeof body.task_display_id !== 'string') {
+      throw new BadRequestException('task_display_id required');
+    }
+    if (typeof body.feedback !== 'string' || body.feedback.trim().length === 0) {
+      throw new BadRequestException('feedback required');
+    }
+    // Strict T-<number> shape so we never inject weird display_id
+    // values into the SELECT. Uppercase or lowercase T both OK.
+    const displayId = body.task_display_id.trim();
+    if (!/^[A-Za-z0-9-]{1,64}$/.test(displayId)) {
+      throw new BadRequestException('invalid task_display_id');
+    }
+    const task = await this.tasks.findByDisplayId(host.project_id, displayId);
+    if (!task) {
+      throw new BadRequestException(
+        `task ${displayId} not found in project ${host.project_slug}`,
+      );
+    }
+    if (task.status !== 'ready_for_test') {
+      throw new BadRequestException(
+        `task ${displayId} is in status '${task.status}', can only reject from 'ready_for_test'`,
+      );
+    }
+
+    // Decode + size-cap attachments the same way the cookie-auth
+    // reject endpoint does: max 5 files, 1 MB each.
+    const MAX_FILES = 5;
+    const MAX_BYTES = 1_000_000;
+    const files: Array<{ name: string; content: string; size: number }> = [];
+    for (const raw of (body.files ?? []).slice(0, MAX_FILES)) {
+      if (typeof raw.name !== 'string' || typeof raw.content_base64 !== 'string') {
+        throw new BadRequestException('each file needs name + content_base64');
+      }
+      const buf = Buffer.from(raw.content_base64, 'base64');
+      if (buf.length > MAX_BYTES) {
+        throw new BadRequestException(
+          `file ${raw.name} too large (${buf.length} > ${MAX_BYTES})`,
+        );
+      }
+      files.push({
+        name: raw.name.replace(/[^a-zA-Z0-9._-]/g, '_').slice(0, 128),
+        content: raw.content_base64,
+        size: buf.length,
+      });
+    }
+
+    try {
+      await this.tasks.reject(
+        task.id,
+        null,
+        body.feedback,
+        files,
+        `host:${host.project_slug}`,
+      );
+    } catch (err) {
+      throw new BadRequestException((err as Error).message);
+    }
+    return { ok: true, task_id: task.id };
   }
 }

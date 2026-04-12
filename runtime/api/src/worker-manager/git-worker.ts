@@ -1,7 +1,8 @@
 /* eslint-disable no-console */
 import { spawn } from 'node:child_process';
 import { mkdir, rm, writeFile, chmod } from 'node:fs/promises';
-import { existsSync } from 'node:fs';
+import { existsSync, createWriteStream, WriteStream } from 'node:fs';
+import { basename } from 'node:path';
 
 /**
  * Fas B1 worker runtime — real git + Claude CLI.
@@ -41,9 +42,10 @@ import { existsSync } from 'node:fs';
 
 const WORKTREES_BASE = '/var/lib/devloop/worktrees';
 const CONTEXTS_BASE = '/var/lib/devloop/contexts';
+const WORKER_LOGS_DIR = '/var/lib/devloop/logs';
 const CLAUDE_BIN = '/var/lib/devloop/bin/claude';
 const CLAUDE_HOME = '/var/lib/devloop/claude-home';
-const CLAUDE_TIMEOUT_MS = 15 * 60 * 1000;
+const CLAUDE_TIMEOUT_MS = 120 * 60 * 1000;
 const CLAUDE_MAX_BUDGET_USD = '5';
 const CLAUDE_ALLOWED_TOOLS =
   'Read Edit Write Glob Grep Bash(git:status,git:diff,git:log,ls,cat,rg,grep,find,node,npm:run,npx:tsc)';
@@ -480,11 +482,18 @@ async function runClaude(
   }
   const userPrompt = userPromptParts.join('\n');
 
+  // stream-json emits one JSON event per line: system init, assistant
+  // messages, tool_use, tool_result, and a final "result" event. We
+  // pipe every event to /var/lib/devloop/logs/task-<taskId>.jsonl so
+  // a dead run leaves forensics behind even if SIGKILL'd. The final
+  // "result" event carries is_error/result/session_id/total_cost_usd
+  // — we pluck those out for the WorkerRunResult.
   const args = [
     '-p',
     userPrompt,
     '--output-format',
-    'json',
+    'stream-json',
+    '--verbose',
     '--append-system-prompt',
     systemPrompt,
     '--permission-mode',
@@ -500,7 +509,29 @@ async function runClaude(
     '--no-session-persistence',
   ];
 
-  console.log(`[worker] spawning claude in ${worktree}`);
+  // taskId is the last segment of contextDir (contextDir =
+  // `${CONTEXTS_BASE}/${input.taskId}`). We derive it here to avoid
+  // threading another param through the callsite.
+  const derivedTaskId = basename(contextDir);
+  await mkdir(WORKER_LOGS_DIR, { recursive: true });
+  const logPath = `${WORKER_LOGS_DIR}/task-${derivedTaskId}.jsonl`;
+  const logStream: WriteStream = createWriteStream(logPath, { flags: 'a' });
+  const writeLogLine = (obj: Record<string, unknown>): void => {
+    try {
+      logStream.write(`${JSON.stringify(obj)}\n`);
+    } catch {
+      // Best-effort logging — never let a bad log write kill the run.
+    }
+  };
+  writeLogLine({
+    t: new Date().toISOString(),
+    kind: 'spawn',
+    task_id: derivedTaskId,
+    worktree,
+    context_dir: contextDir,
+  });
+
+  console.log(`[worker] spawning claude in ${worktree} (log: ${logPath})`);
 
   return new Promise((resolve, reject) => {
     const proc = spawn(CLAUDE_BIN, args, {
@@ -517,62 +548,154 @@ async function runClaude(
       // it' and then exits 1 before completing the run.
       stdio: ['ignore', 'pipe', 'pipe'],
     });
-    let stdout = '';
+
+    let stdoutBuf = '';
     let stderr = '';
+    let finalResultEvent: {
+      is_error?: boolean;
+      result?: string;
+      session_id?: string;
+      total_cost_usd?: number;
+      num_turns?: number;
+      subtype?: string;
+      type?: string;
+    } | null = null;
+    let lastEventType = 'none';
+    let eventCount = 0;
+    let toolUseCount = 0;
+
+    // Line-oriented parsing of stream-json NDJSON output. We
+    // intentionally tolerate partial lines (buffer tail) and
+    // non-JSON debug lines (logged but not parsed).
+    const handleLine = (line: string): void => {
+      const trimmed = line.trim();
+      if (trimmed.length === 0) return;
+      if (trimmed[0] !== '{') {
+        writeLogLine({
+          t: new Date().toISOString(),
+          kind: 'non_json_stdout',
+          line: trimmed.slice(0, 500),
+        });
+        return;
+      }
+      eventCount++;
+      let event: Record<string, unknown>;
+      try {
+        event = JSON.parse(trimmed) as Record<string, unknown>;
+      } catch {
+        writeLogLine({
+          t: new Date().toISOString(),
+          kind: 'parse_error',
+          line: trimmed.slice(0, 500),
+        });
+        return;
+      }
+      const et = typeof event.type === 'string' ? event.type : 'unknown';
+      lastEventType = et;
+      if (et === 'assistant') {
+        const msg = event.message as { content?: Array<{ type?: string }> } | undefined;
+        const content = Array.isArray(msg?.content) ? msg!.content : [];
+        for (const block of content) {
+          if (block && block.type === 'tool_use') toolUseCount++;
+        }
+      }
+      writeLogLine({ t: new Date().toISOString(), ...event });
+      if (et === 'result') {
+        finalResultEvent = event as typeof finalResultEvent;
+      }
+    };
+
     proc.stdout.on('data', (chunk: Buffer) => {
-      stdout += chunk.toString('utf8');
+      stdoutBuf += chunk.toString('utf8');
+      let nl: number;
+      while ((nl = stdoutBuf.indexOf('\n')) >= 0) {
+        const line = stdoutBuf.slice(0, nl);
+        stdoutBuf = stdoutBuf.slice(nl + 1);
+        handleLine(line);
+      }
     });
     proc.stderr.on('data', (chunk: Buffer) => {
-      stderr += chunk.toString('utf8');
+      const s = chunk.toString('utf8');
+      stderr += s;
+      writeLogLine({
+        t: new Date().toISOString(),
+        kind: 'stderr',
+        chunk: s.slice(0, 2000),
+      });
     });
+
     const timer = setTimeout(() => {
+      writeLogLine({
+        t: new Date().toISOString(),
+        kind: 'timeout_kill',
+        timeout_ms: CLAUDE_TIMEOUT_MS,
+        events_seen: eventCount,
+        tool_uses_seen: toolUseCount,
+        last_event_type: lastEventType,
+      });
       proc.kill('SIGKILL');
-      reject(new Error(`claude timed out after ${CLAUDE_TIMEOUT_MS}ms`));
+      reject(
+        new Error(
+          `claude timed out after ${CLAUDE_TIMEOUT_MS}ms (events=${eventCount} tool_uses=${toolUseCount} last=${lastEventType})`,
+        ),
+      );
     }, CLAUDE_TIMEOUT_MS);
+
     proc.on('error', (err) => {
       clearTimeout(timer);
+      writeLogLine({
+        t: new Date().toISOString(),
+        kind: 'spawn_error',
+        error: err.message,
+      });
+      logStream.end();
       reject(err);
     });
+
     proc.on('close', (code) => {
       clearTimeout(timer);
+      // Flush any trailing partial line that never got a newline.
+      if (stdoutBuf.length > 0) handleLine(stdoutBuf);
+      writeLogLine({
+        t: new Date().toISOString(),
+        kind: 'exit',
+        exit_code: code,
+        events_seen: eventCount,
+        tool_uses_seen: toolUseCount,
+        last_event_type: lastEventType,
+      });
+      logStream.end();
+
       if (code !== 0) {
         reject(
           new Error(
-            `claude exited ${code}: ${stderr.slice(-500) || stdout.slice(-500)}`,
+            `claude exited ${code}: ${stderr.slice(-500) || `events=${eventCount} last=${lastEventType}`}`,
           ),
         );
         return;
       }
-      try {
-        const parsed = JSON.parse(stdout) as {
-          is_error?: boolean;
-          result?: string;
-          session_id?: string;
-          total_cost_usd?: number;
-          num_turns?: number;
-          subtype?: string;
-        };
-        if (parsed.is_error) {
-          reject(
-            new Error(
-              `claude reported error (${parsed.subtype ?? 'unknown'}): ${(parsed.result ?? '').slice(0, 500)}`,
-            ),
-          );
-          return;
-        }
-        resolve({
-          sessionId: parsed.session_id ?? 'unknown',
-          costUsd: parsed.total_cost_usd ?? 0,
-          numTurns: parsed.num_turns ?? 0,
-          summary: parsed.result ?? '',
-        });
-      } catch (e) {
+      if (!finalResultEvent) {
         reject(
           new Error(
-            `claude output was not valid JSON: ${(e as Error).message}; first 200 bytes: ${stdout.slice(0, 200)}`,
+            `claude stream-json emitted no "result" event (events=${eventCount} last=${lastEventType}); see ${logPath}`,
           ),
         );
+        return;
       }
+      if (finalResultEvent.is_error) {
+        reject(
+          new Error(
+            `claude reported error (${finalResultEvent.subtype ?? 'unknown'}): ${(finalResultEvent.result ?? '').slice(0, 500)}`,
+          ),
+        );
+        return;
+      }
+      resolve({
+        sessionId: finalResultEvent.session_id ?? 'unknown',
+        costUsd: finalResultEvent.total_cost_usd ?? 0,
+        numTurns: finalResultEvent.num_turns ?? 0,
+        summary: finalResultEvent.result ?? '',
+      });
     });
   });
 }

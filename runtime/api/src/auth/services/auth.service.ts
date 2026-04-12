@@ -5,6 +5,7 @@ import {
   OnModuleInit,
   UnauthorizedException,
 } from '@nestjs/common';
+import * as QRCode from 'qrcode';
 import { DataSource } from 'typeorm';
 import { DATA_SOURCE } from '../../db/db.module';
 import { Challenge2faService } from './challenge-2fa.service';
@@ -291,7 +292,7 @@ export class AuthService implements OnModuleInit {
    */
   public async beginEnroll2fa(
     userId: string,
-  ): Promise<{ secret: string; otpauthUri: string }> {
+  ): Promise<{ secret: string; otpauthUri: string; qrPngBase64: string }> {
     const rows = (await this.ds.query(
       `SELECT email::text AS email, two_factor_enrolled FROM public.users WHERE id = $1`,
       [userId],
@@ -310,7 +311,17 @@ export class AuthService implements OnModuleInit {
       [encrypted, userId],
     );
     const otpauthUri = this.totp.buildOtpauthUri(user.email, secret);
-    return { secret, otpauthUri };
+    // Render the otpauth URI as a PNG QR code server-side so the
+    // frontend only has to `<img src="data:image/png;base64,…">`.
+    // We avoid pulling a JS QR library into the web bundle.
+    const qrPngBuf = await QRCode.toBuffer(otpauthUri, {
+      errorCorrectionLevel: 'M',
+      type: 'png',
+      margin: 1,
+      width: 240,
+    });
+    const qrPngBase64 = qrPngBuf.toString('base64');
+    return { secret, otpauthUri, qrPngBase64 };
   }
 
   /**
@@ -344,6 +355,112 @@ export class AuthService implements OnModuleInit {
       [userId],
     );
     await this.safeEmitAudit(userId, 'user_2fa_enabled', 'user', user.email, {});
+  }
+
+  /**
+   * Return the current auth status for a user — used by /auth/me
+   * so the frontend can decide whether to route the user through
+   * the 2FA enrollment page. Reads fresh from the DB, not from
+   * the session, so flipping enrolled in the confirm step is
+   * visible on the very next /auth/me call.
+   */
+  public async getUserAuthStatus(
+    userId: string,
+  ): Promise<{ email: string; mustEnroll2fa: boolean }> {
+    const rows = (await this.ds.query(
+      `SELECT email::text AS email, two_factor_enrolled, two_factor_required
+         FROM public.users
+        WHERE id = $1
+        LIMIT 1`,
+      [userId],
+    )) as Array<{
+      email: string;
+      two_factor_enrolled: boolean;
+      two_factor_required: boolean;
+    }>;
+    const user = rows[0];
+    if (!user) {
+      throw new UnauthorizedException('unauthorized');
+    }
+    return {
+      email: user.email,
+      mustEnroll2fa: user.two_factor_required && !user.two_factor_enrolled,
+    };
+  }
+
+  /**
+   * List all users for the admin user-management page. Excludes
+   * password_hash + two_factor_secret from the projection so even
+   * if a buggy caller passes the result straight back to the
+   * browser, no secrets leak.
+   */
+  public async listUsers(): Promise<
+    Array<{
+      id: string;
+      email: string;
+      role: string;
+      two_factor_enrolled: boolean;
+      last_login_at: string | null;
+      created_at: string;
+    }>
+  > {
+    const rows = (await this.ds.query(
+      `SELECT id::text AS id,
+              email::text AS email,
+              role::text AS role,
+              two_factor_enrolled,
+              last_login_at,
+              created_at
+         FROM public.users
+        ORDER BY created_at ASC`,
+    )) as Array<{
+      id: string;
+      email: string;
+      role: string;
+      two_factor_enrolled: boolean;
+      last_login_at: Date | null;
+      created_at: Date;
+    }>;
+    return rows.map((r) => ({
+      id: r.id,
+      email: r.email,
+      role: r.role,
+      two_factor_enrolled: r.two_factor_enrolled,
+      last_login_at:
+        r.last_login_at === null ? null : new Date(r.last_login_at).toISOString(),
+      created_at: new Date(r.created_at).toISOString(),
+    }));
+  }
+
+  /**
+   * Create a new user. Hashes the password with the same argon2id
+   * parameters as the existing bootstrap flow, inserts with
+   * two_factor_required=true so the new user hits the enrollment
+   * page on first login. Emits an audit event naming the creator.
+   */
+  public async createUser(
+    email: string,
+    password: string,
+    role: string,
+    createdByUserId: string,
+  ): Promise<{ id: string; email: string; role: string }> {
+    const passwordHash = await this.passwords.hash(password);
+    const rows = (await this.ds.query(
+      `INSERT INTO public.users
+         (email, password_hash, role, two_factor_required, two_factor_enrolled)
+       VALUES ($1::citext, $2, $3::public.user_role_enum, true, false)
+       RETURNING id::text AS id, email::text AS email, role::text AS role`,
+      [email, passwordHash, role],
+    )) as Array<{ id: string; email: string; role: string }>;
+    const created = rows[0];
+    if (!created) {
+      throw new Error('user insert returned no row');
+    }
+    await this.safeEmitAudit(createdByUserId, 'user_created', 'user', email, {
+      new_user_id: created.id,
+      new_user_role: role,
+    });
+    return created;
   }
 
   public async logout(sessionId: string, userId: string): Promise<void> {
