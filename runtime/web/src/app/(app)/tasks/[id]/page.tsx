@@ -2,6 +2,8 @@ import { cookies } from 'next/headers';
 import Link from 'next/link';
 import { apiFetchServer } from '@/lib/api';
 import { ApproveRejectPanel } from './ApproveRejectPanel';
+import { DeployActivity } from './DeployActivity';
+import { TaskDetailAutoRefresh } from './TaskDetailAutoRefresh';
 import { ThreadPanel } from './ThreadPanel';
 
 export const dynamic = 'force-dynamic';
@@ -58,6 +60,17 @@ interface TaskDetail {
     size: number;
     content_base64: string;
     created_at: string;
+  }>;
+  deploy_activity?: Array<{
+    id: string;
+    action: string;
+    issued_at: string;
+    apply_started_at: string | null;
+    applied_at: string | null;
+    applied_status: string | null;
+    applied_log_excerpt: string | null;
+    deploy_sha: string;
+    slot: 'deploy' | 'rollback' | 'other';
   }>;
 }
 
@@ -135,6 +148,7 @@ export default async function TaskDetailPage({
 
   return (
     <div className="page">
+      <TaskDetailAutoRefresh status={task.status} />
       <div className="page-header">
         <h1>
           {task.display_id}{' '}
@@ -178,6 +192,16 @@ export default async function TaskDetailPage({
           </div>
         </section>
       )}
+
+      <section style={{ marginBottom: 24 }}>
+        <h2 style={{ fontSize: 14, fontWeight: 600, marginBottom: 6 }}>
+          Deploy activity
+        </h2>
+        <DeployActivity
+          taskStatus={task.status}
+          deployActivity={task.deploy_activity ?? []}
+        />
+      </section>
 
       <section style={{ marginBottom: 24 }}>
         <h2 style={{ fontSize: 14, fontWeight: 600, marginBottom: 6 }}>Pipeline output</h2>

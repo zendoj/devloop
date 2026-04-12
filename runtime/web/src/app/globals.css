@@ -475,6 +475,19 @@ a:hover {
   color: #ff9090;
 }
 
+/* Deploy activity stage indicator — pulses the current stage dot. */
+
+@keyframes devloop-pulse {
+  0%, 100% {
+    opacity: 1;
+    transform: scale(1);
+  }
+  50% {
+    opacity: 0.5;
+    transform: scale(1.25);
+  }
+}
+
 .sidebar-footer-label {
   font-size: 11px;
   text-transform: uppercase;

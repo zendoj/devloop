@@ -233,9 +233,39 @@ export class TasksService {
       [task.report_id],
     )) as Array<ReportAttachmentRow>;
 
+    // Deploy activity: the applied desired_state (and any
+    // rollback) for this task so the detail UI can show
+    // "rebuilding frontend... / restarting pm2 / done" live.
+    // One row per desired_state id attached to the task.
+    const deployRows = (await this.ds.query(
+      `
+      SELECT
+        dsh.id::text              AS id,
+        dsh.action::text          AS action,
+        dsh.issued_at,
+        dsh.apply_started_at,
+        dsh.applied_at,
+        dsh.applied_status::text  AS applied_status,
+        dsh.applied_log_excerpt,
+        dsh.deploy_sha,
+        CASE
+          WHEN dsh.id = at.applied_desired_state_id THEN 'deploy'
+          WHEN dsh.id = at.rollback_desired_state_id THEN 'rollback'
+          ELSE 'other'
+        END AS slot
+      FROM public.agent_tasks at
+      JOIN public.desired_state_history dsh
+        ON dsh.id IN (at.applied_desired_state_id, at.rollback_desired_state_id)
+      WHERE at.id = $1
+      ORDER BY dsh.issued_at ASC
+      `,
+      [id],
+    )) as Array<DeployActivityRow>;
+
     task.feedback = feedback;
     task.threads = threads;
     task.attachments = attachments;
+    task.deploy_activity = deployRows;
     return task;
   }
 
@@ -421,6 +451,19 @@ export interface TaskDetail {
   feedback?: TaskFeedbackRow[];
   threads?: ThreadRow[];
   attachments?: ReportAttachmentRow[];
+  deploy_activity?: DeployActivityRow[];
+}
+
+export interface DeployActivityRow {
+  id: string;
+  action: string;
+  issued_at: string;
+  apply_started_at: string | null;
+  applied_at: string | null;
+  applied_status: string | null;
+  applied_log_excerpt: string | null;
+  deploy_sha: string;
+  slot: 'deploy' | 'rollback' | 'other';
 }
 
 export interface ReportAttachmentRow {
