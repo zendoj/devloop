@@ -5,83 +5,64 @@ import { useRouter } from 'next/navigation';
 
 /**
  * Polls the server every POLL_MS and calls router.refresh() so
- * the parent server component re-fetches /api/tasks. Also beeps
- * in the browser when the "ready_for_test" count increases
- * between two polls — that's the "you have a task to accept or
- * reject" notification.
+ * the parent server component re-fetches /api/tasks. Plays a
+ * notification chime in the browser when the "ready_for_test"
+ * count grows between two polls.
  *
- * Sound: a short 440Hz sine tone via WebAudio, no external
- * asset file. Most browsers block autoplay until the first user
- * interaction, so we register a one-shot pointerdown listener
- * that "unlocks" the AudioContext on any click anywhere on the
- * page. After that, beeps work on every new ready_for_test task.
+ * Sound: a real audio file (universfield notification chime)
+ * served from /sounds/notification.{opus,mp3}. Opus is preferred
+ * — 2.4s chime comes out ~28 KB instead of 75 KB, and every
+ * modern browser supports it. The MP3 is kept as a <source>
+ * fallback for the rare legacy case.
+ *
+ * Browsers block audio playback until the user interacts with
+ * the page. We register a one-shot pointerdown/keydown listener
+ * that "unlocks" the audio element on the first click anywhere.
+ * After that, every new ready_for_test task chimes on the next
+ * poll cycle.
  */
 
 const POLL_MS = 5_000;
 
-let audioCtx: AudioContext | null = null;
 let unlocked = false;
-
-function ensureAudio(): AudioContext | null {
-  if (typeof window === 'undefined') return null;
-  if (!audioCtx) {
-    try {
-      const Ctor =
-        (window as typeof window & {
-          webkitAudioContext?: typeof AudioContext;
-        }).AudioContext ??
-        (window as typeof window & {
-          webkitAudioContext?: typeof AudioContext;
-        }).webkitAudioContext;
-      if (!Ctor) return null;
-      audioCtx = new Ctor();
-    } catch {
-      return null;
-    }
-  }
-  return audioCtx;
-}
-
-function beep(): void {
-  const ctx = ensureAudio();
-  if (!ctx || !unlocked) return;
-  const now = ctx.currentTime;
-  const osc = ctx.createOscillator();
-  const gain = ctx.createGain();
-  osc.type = 'sine';
-  osc.frequency.setValueAtTime(880, now);
-  osc.frequency.setValueAtTime(660, now + 0.15);
-  gain.gain.setValueAtTime(0, now);
-  gain.gain.linearRampToValueAtTime(0.2, now + 0.02);
-  gain.gain.linearRampToValueAtTime(0, now + 0.35);
-  osc.connect(gain);
-  gain.connect(ctx.destination);
-  osc.start(now);
-  osc.stop(now + 0.4);
-}
 
 export function TasksAutoRefresh({
   readyForTestCount,
 }: {
   readyForTestCount: number;
-}): React.ReactElement | null {
+}): React.ReactElement {
   const router = useRouter();
+  const audioRef = useRef<HTMLAudioElement | null>(null);
   const lastCountRef = useRef<number>(readyForTestCount);
 
-  // One-shot user-interaction unlock for the AudioContext.
-  // Browsers silently mute WebAudio until the user clicks
-  // anywhere; we register a capture-phase listener that runs
-  // once on the very first pointer/keydown event and resumes
-  // the context so subsequent beep() calls actually produce
-  // sound.
+  // One-shot user-interaction unlock. On the first click or
+  // keypress anywhere on the page we call audio.play() once
+  // at volume 0 to satisfy the autoplay policy, then immediately
+  // pause and rewind. From that point on .play() works without
+  // any gesture.
   useEffect(() => {
     if (typeof window === 'undefined') return;
     const unlock = (): void => {
-      const ctx = ensureAudio();
-      if (ctx && ctx.state === 'suspended') {
-        void ctx.resume();
+      if (unlocked) return;
+      const audio = audioRef.current;
+      if (audio) {
+        const prevVolume = audio.volume;
+        audio.volume = 0;
+        audio
+          .play()
+          .then(() => {
+            audio.pause();
+            audio.currentTime = 0;
+            audio.volume = prevVolume;
+            unlocked = true;
+          })
+          .catch(() => {
+            // even the zero-volume unlock failed — will retry
+            // on the next user gesture
+          });
+      } else {
+        unlocked = true;
       }
-      unlocked = true;
       window.removeEventListener('pointerdown', unlock, true);
       window.removeEventListener('keydown', unlock, true);
     };
@@ -93,22 +74,28 @@ export function TasksAutoRefresh({
     };
   }, []);
 
-  // Beep when the ready_for_test count grows between renders.
-  // The parent server component passes the current count as a
-  // prop every time it re-renders. We stash the previous value
-  // in a ref and compare on each prop change.
+  // Chime when the ready_for_test count grows between renders.
   useEffect(() => {
     if (readyForTestCount > lastCountRef.current) {
-      beep();
+      const audio = audioRef.current;
+      if (audio) {
+        try {
+          audio.currentTime = 0;
+          void audio.play().catch(() => {
+            // silent — user hasn't unlocked audio yet
+          });
+        } catch {
+          // silent
+        }
+      }
     }
     lastCountRef.current = readyForTestCount;
   }, [readyForTestCount]);
 
-  // Poll loop: every POLL_MS ask Next.js to re-render the
-  // server component so fresh data flows in from /api/tasks.
-  // router.refresh() only refetches server data — it doesn't
-  // do a full navigation, so the user's scroll position and
-  // form inputs are preserved.
+  // Poll loop: ask Next.js to re-render the server component so
+  // fresh /api/tasks data flows in. router.refresh() only
+  // refetches server data — it doesn't do a full navigation, so
+  // the user's scroll position and form inputs are preserved.
   useEffect(() => {
     const id = setInterval(() => {
       router.refresh();
@@ -116,5 +103,15 @@ export function TasksAutoRefresh({
     return () => clearInterval(id);
   }, [router]);
 
-  return null;
+  return (
+    <audio
+      ref={audioRef}
+      preload="auto"
+      style={{ display: 'none' }}
+      aria-hidden
+    >
+      <source src="/sounds/notification.opus" type="audio/ogg; codecs=opus" />
+      <source src="/sounds/notification.mp3" type="audio/mpeg" />
+    </audio>
+  );
 }

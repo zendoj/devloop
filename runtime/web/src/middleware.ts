@@ -24,7 +24,9 @@ export function middleware(req: NextRequest): NextResponse {
     pathname === '/api' ||
     pathname.startsWith('/api/') ||
     pathname.startsWith('/_next/') ||
-    pathname === '/favicon.ico'
+    pathname === '/favicon.ico' ||
+    pathname === '/icon.svg' ||
+    pathname.startsWith('/sounds/')
   ) {
     return NextResponse.next();
   }
