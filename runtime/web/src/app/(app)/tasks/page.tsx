@@ -2,6 +2,7 @@ import { cookies } from 'next/headers';
 import Link from 'next/link';
 import { apiFetchServer } from '@/lib/api';
 import { QuickActionButtons } from './QuickActionButtons';
+import { TasksAutoRefresh } from './TasksAutoRefresh';
 
 export const dynamic = 'force-dynamic';
 
@@ -120,6 +121,7 @@ export default async function TasksPage({
 
   return (
     <div className="page">
+      <TasksAutoRefresh readyForTestCount={counts.ready_for_test} />
       <div className="page-header">
         <h1>Tasks</h1>
         <p className="page-sub">

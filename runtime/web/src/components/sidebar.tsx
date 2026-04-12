@@ -2,6 +2,7 @@
 
 import Link from 'next/link';
 import { usePathname } from 'next/navigation';
+import FilesPanel from './files-panel';
 
 interface NavItem {
   href: string;
@@ -50,9 +51,10 @@ export default function Sidebar(): React.ReactElement {
           );
         })}
       </nav>
+      <FilesPanel />
       <div className="sidebar-footer">
         <div className="sidebar-footer-label">Build</div>
-        <div className="sidebar-footer-value">Fas 1a · dev</div>
+        <div className="sidebar-footer-value">Fas I · dev</div>
       </div>
     </aside>
   );
