@@ -29,7 +29,7 @@ interface StoredFile {
 }
 
 const POLL_MS = 10_000;
-const MAX_BYTES = 50 * 1024 * 1024;
+const MAX_BYTES = 500 * 1024 * 1024;
 
 function formatSize(n: number): string {
   if (n < 1024) return `${n}B`;
@@ -46,13 +46,10 @@ function relTime(iso: string): string {
   return `${Math.floor(s / 86400)}d ago`;
 }
 
-async function fileToBase64(file: File): Promise<string> {
-  const buf = await file.arrayBuffer();
-  const bytes = new Uint8Array(buf);
-  let bin = '';
-  for (let i = 0; i < bytes.length; i++) bin += String.fromCharCode(bytes[i]!);
-  return btoa(bin);
-}
+// Multipart upload (NOT base64 JSON) is used to support up to
+// 500 MB uploads. Base64 would produce a ~670 MB string in
+// memory on the browser side and crash the tab before the POST
+// even leaves the client.
 
 export default function FilesPanel(): React.ReactElement {
   const [files, setFiles] = useState<StoredFile[]>([]);
@@ -88,17 +85,16 @@ export default function FilesPanel(): React.ReactElement {
       try {
         for (const f of arr) {
           if (f.size > MAX_BYTES) {
-            throw new Error(`${f.name} too large (${formatSize(f.size)} > 50MB)`);
+            throw new Error(
+              `${f.name} too large (${formatSize(f.size)} > 500MB)`,
+            );
           }
-          const base64 = await fileToBase64(f);
+          const form = new FormData();
+          form.append('file', f, f.name);
           const res = await fetch('/api/files', {
             method: 'POST',
             credentials: 'include',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              name: f.name,
-              content_base64: base64,
-            }),
+            body: form,
           });
           if (!res.ok) {
             const text = await res.text();

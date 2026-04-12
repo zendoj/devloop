@@ -32,7 +32,7 @@ import { randomBytes } from 'node:crypto';
  */
 
 const FILES_DIR = '/var/lib/devloop/files';
-const MAX_FILE_BYTES = 50 * 1024 * 1024; // 50 MB per file
+const MAX_FILE_BYTES = 500 * 1024 * 1024; // 500 MB per file
 const NAME_PATTERN = /^[A-Za-z0-9._-]{1,128}$/;
 
 export interface StoredFile {

@@ -68,24 +68,41 @@ async function bootstrap(): Promise<void> {
     process.exit(1);
   }
 
-  // Fas 0.1 scaffolding: use Fastify's default bodyLimit. No upload/ingest
-  // endpoints exist yet; widening the limit is deferred until a phase that
-  // actually requires it (report intake in Fas 1).
+  // Body limit is raised to ~520 MB (with a small headroom over
+  // the 500 MB per-file cap the Files sidebar advertises) so the
+  // operator can upload large reference files (screen recordings,
+  // datasets, DB dumps) to the scratchpad under /var/lib/devloop/
+  // files. JSON endpoints (reports, tasks, etc.) are still
+  // implicitly capped by their own DTO length checks — this
+  // bodyLimit only removes the global ceiling.
   const app = await NestFactory.create<NestFastifyApplication>(
     AppModule,
     new FastifyAdapter({
       trustProxy: false,
+      bodyLimit: 520 * 1024 * 1024,
     }),
     {
       logger: ['log', 'warn', 'error'],
     },
   );
 
-  // @fastify/cookie provides req.cookies parsing. No cookie signing key
-  // is configured — the devloop_session cookie is an opaque random token
-  // whose authenticity is proven by a DB lookup against its SHA-256
-  // hash, not by HMAC signing.
+  // @fastify/cookie provides req.cookies parsing.
   await app.register(fastifyCookie as never);
+
+  // @fastify/multipart handles the /api/files POST upload. We
+  // use its helper methods from the controller (req.file()) to
+  // stream bytes straight into /var/lib/devloop/files/ without
+  // ever holding the full payload in memory. The 520 MB limit
+  // matches bodyLimit above.
+  // eslint-disable-next-line @typescript-eslint/no-require-imports
+  const fastifyMultipart = require('@fastify/multipart') as unknown;
+  await app.register(fastifyMultipart as never, {
+    limits: {
+      fileSize: 520 * 1024 * 1024,
+      files: 10,
+      fields: 10,
+    },
+  });
 
   await app.listen(port, host);
   // eslint-disable-next-line no-console

@@ -48,20 +48,32 @@ export class FilesController {
     @Req() req: RequestWithSession,
   ): Promise<StoredFile> {
     if (!req.session) throw new UnauthorizedException('unauthorized');
-    const body = req.body as { name?: unknown; content_base64?: unknown } | undefined;
-    if (!body || typeof body.name !== 'string' || typeof body.content_base64 !== 'string') {
-      throw new BadRequestException('name and content_base64 required');
+    // @fastify/multipart adds req.file() / req.isMultipart()
+    // to the fastify request. Use them via a loose cast since
+    // the Nest type for @Req doesn't carry the plugin types.
+    const reqAny = req as unknown as {
+      isMultipart: () => boolean;
+      file: () => Promise<
+        | {
+            filename: string;
+            mimetype: string;
+            toBuffer: () => Promise<Buffer>;
+          }
+        | undefined
+      >;
+    };
+    if (typeof reqAny.isMultipart !== 'function' || !reqAny.isMultipart()) {
+      throw new BadRequestException('multipart/form-data required');
     }
-    let buf: Buffer;
-    try {
-      buf = Buffer.from(body.content_base64, 'base64');
-    } catch {
-      throw new BadRequestException('content_base64 is not valid base64');
+    const file = await reqAny.file();
+    if (!file) {
+      throw new BadRequestException('no file in multipart body');
     }
+    const buf = await file.toBuffer();
     if (buf.length === 0) {
       throw new BadRequestException('empty file');
     }
-    return this.files.save(body.name, buf);
+    return this.files.save(file.filename, buf);
   }
 
   @Get(':name')
