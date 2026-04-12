@@ -221,50 +221,79 @@ export async function callAgent(
 // Jonas's explicit guidance (2026-04-11): max 5 simultaneous; must
 // wait between bursts; stop everything if ChatGPT says temporarily
 // limited.
-// Tightened 2026-04-12 after hitting ChatGPT's "You're making
-// requests too quickly" anti-abuse during back-to-back reports.
-// The previous 5 concurrent / 8s min delay averaged ~7 calls/min
-// sustained, which tripped the per-account rate limit when 4
-// agent roles (classifier, planner, reviewer, summarizer) fired
-// per task. 2 concurrent / 15s delay caps us at ~4 calls/min —
-// comfortably under ChatGPT's burst threshold. Tasks take ~90s
-// longer through the pipeline, but the pipeline doesn't wedge.
+// Concurrency and throughput throttle stays, but the old
+// 10-minute blanket cooldown driven by error-string matching is
+// gone. Webengine now returns structured {errorCode,
+// suggestedWaitSec} on /api/job/:jobId — we respect that
+// directly via the retry loop in callWebengine() and the
+// shared "paused until" timestamp below.
 const WEBENGINE_MAX_CONCURRENT = 2;
 const WEBENGINE_MIN_DELAY_MS = 15_000;
-const WEBENGINE_COOLDOWN_MS = 10 * 60 * 1000;
 // Webengine allows 5-120 as autoDeleteMinutes on /ask submits.
 // We set it to the minimum on every call so each conversation
 // is garbage-collected 5 minutes after the response lands. DevLoop
 // never re-opens a conversation (we run stateless per request),
 // so there's nothing to lose by having the upstream tidy up.
-// Without this, ChatGPT accumulates one session per agent call
-// and drowns in "2000 chats".
 const WEBENGINE_AUTO_DELETE_MINUTES = 5;
+// Max retries on recoverable job errors before giving up. 3
+// attempts × (worst-case 5 min wait) = 15 min upper bound for
+// a recoverable rate-limit burst — comfortably inside the
+// reviewer's overall task-stall tolerance.
+const WEBENGINE_MAX_RETRY_ATTEMPTS = 3;
 
 let webengineActive = 0;
 const webengineWaiters: Array<() => void> = [];
 let webengineLastSubmitAt = 0;
-let webengineCooldownUntil = 0;
+// Global "webengine is paused until this wall-clock ts" gate.
+// Set by any call that sees a suggestedWaitSec from webengine,
+// read by every subsequent call so one rate-limit event pauses
+// ALL roles instead of each role discovering the limit on its
+// own turn. Zero means no pause.
+let webenginePausedUntil = 0;
+
+/**
+ * Error thrown when webengine's structured error response tells
+ * us the upstream needs human intervention (re-login). The
+ * reviewer / classifier / etc. catch this and leave the task in
+ * its current status rather than retrying.
+ */
+export class WebengineLoginRequiredError extends Error {
+  public readonly errorCode = 'login_required';
+  constructor(public readonly detail: string) {
+    super(`webengine login_required: ${detail}`);
+    this.name = 'WebengineLoginRequiredError';
+  }
+}
+
+interface WebengineJobError {
+  errorCode?: string;
+  error?: string;
+  suggestedWaitSec?: number;
+  detectedSnippet?: string;
+}
 
 async function withWebengineSlot<T>(fn: () => Promise<T>): Promise<T> {
-  // Hard block if we're in cooldown — surface as an error the
-  // caller can catch and retry later.
-  const now = Date.now();
-  if (webengineCooldownUntil > now) {
-    const remaining = Math.ceil((webengineCooldownUntil - now) / 1000);
-    throw new Error(
-      `webengine cooldown active (${remaining}s remaining after upstream rate-limit signal)`,
+  // Respect any global pause set by a prior call. Wait inline so
+  // callers never observe a stale rate-limit — the sleep is
+  // bounded because any call that sets the pause also caps the
+  // wait at the webengine-advertised suggestedWaitSec.
+  while (webenginePausedUntil > Date.now()) {
+    const waitMs = webenginePausedUntil - Date.now();
+    const waitSec = Math.ceil(waitMs / 1000);
+    console.warn(
+      `[agent] webengine globally paused ${waitSec}s — waiting before submitting`,
     );
+    await sleep(Math.min(waitMs, 60_000));
   }
 
-  // Wait for a slot if concurrency cap is hit.
+  // Wait for a concurrency slot if the cap is hit.
   if (webengineActive >= WEBENGINE_MAX_CONCURRENT) {
     await new Promise<void>((resolve) => webengineWaiters.push(resolve));
   }
 
-  // Throughput throttle: enforce min-delay between SUBMITS. We
-  // do this after claiming a slot so concurrent callers queue
-  // politely on the timer instead of all racing through.
+  // Throughput throttle: enforce min-delay between SUBMITS so
+  // we stay below ChatGPT's burst threshold even when two calls
+  // race through the semaphore.
   const sinceLastSubmit = Date.now() - webengineLastSubmitAt;
   if (sinceLastSubmit < WEBENGINE_MIN_DELAY_MS) {
     await sleep(WEBENGINE_MIN_DELAY_MS - sinceLastSubmit);
@@ -274,22 +303,6 @@ async function withWebengineSlot<T>(fn: () => Promise<T>): Promise<T> {
   webengineActive += 1;
   try {
     return await fn();
-  } catch (err) {
-    // Detect upstream rate-limit signals and open the cooldown
-    // window so every subsequent call bails out fast.
-    const msg = (err as Error).message ?? '';
-    const looksLikeRateLimit =
-      msg.includes('HTTP 429') ||
-      /rate.?limit/i.test(msg) ||
-      /temporarily limited/i.test(msg) ||
-      /too many requests/i.test(msg);
-    if (looksLikeRateLimit) {
-      webengineCooldownUntil = Date.now() + WEBENGINE_COOLDOWN_MS;
-      console.warn(
-        `[agent] webengine cooldown engaged for ${WEBENGINE_COOLDOWN_MS / 1000}s — upstream signaled rate-limit: ${msg.slice(0, 200)}`,
-      );
-    }
-    throw err;
   } finally {
     webengineActive -= 1;
     const next = webengineWaiters.shift();
@@ -298,20 +311,84 @@ async function withWebengineSlot<T>(fn: () => Promise<T>): Promise<T> {
 }
 
 /**
- * Webengine is async: POST /ask (or /ask-with-files) returns
- * {jobId, conversationId}, then we poll /job/:jobId until status
- * is done/error. The base URL is expected to already target the
- * right path root — either http://127.0.0.1:3099 (direct, nginx-
- * stripped) or https://webengine.airpipe.ai/api (through nginx+
- * Cloudflare). Both work with the same path suffix we build here.
+ * Open the global pause window for N seconds. Every subsequent
+ * withWebengineSlot() call will block until this window closes.
+ */
+function pauseWebengine(seconds: number, reason: string): void {
+  const until = Date.now() + seconds * 1000;
+  if (until > webenginePausedUntil) {
+    webenginePausedUntil = until;
+    console.warn(
+      `[agent] webengine paused ${seconds}s globally — ${reason}`,
+    );
+  }
+}
+
+/**
+ * Webengine dispatch: wraps callWebengineOnce() in a retry loop
+ * that respects the upstream's structured error response. When
+ * /api/job/:id returns {status:'error', errorCode, suggestedWaitSec},
+ * we:
+ *   - login_required → throw immediately (no retry, ops page)
+ *   - any other code with suggestedWaitSec → pause globally for
+ *     that many seconds, then resubmit the original prompt up to
+ *     WEBENGINE_MAX_RETRY_ATTEMPTS times
  *
- * When the caller passes `files`, we use POST /ask-with-files as
- * multipart/form-data. The prompt text is kept short because
- * webengine's Playwright driver occasionally trips on long /
- * code-fenced prompts pasted into its chat UI; the heavy content
- * (diffs, file contents, reports) rides along as proper files.
+ * The wait is global (via webenginePausedUntil) so all concurrent
+ * callers block until the window closes rather than each one
+ * discovering the rate-limit on its own turn and wasting another
+ * submit.
  */
 async function callWebengine(
+  baseUrl: string,
+  apiKey: string,
+  model: string,
+  timeoutMs: number,
+  prompt: string,
+  files: CallAgentFile[],
+  conversationRef?: string,
+): Promise<{ text: string; conversationId: string | null }> {
+  let lastErr: WebengineJobError | null = null;
+  for (let attempt = 1; attempt <= WEBENGINE_MAX_RETRY_ATTEMPTS; attempt++) {
+    try {
+      return await callWebengineOnce(
+        baseUrl,
+        apiKey,
+        model,
+        timeoutMs,
+        prompt,
+        files,
+        conversationRef,
+      );
+    } catch (err) {
+      if (err instanceof WebengineLoginRequiredError) throw err;
+      const jobErr = (err as Error & { _jobError?: WebengineJobError })._jobError;
+      if (!jobErr) throw err;
+
+      lastErr = jobErr;
+      const wait = jobErr.suggestedWaitSec ?? 0;
+      console.warn(
+        `[agent] webengine attempt ${attempt}/${WEBENGINE_MAX_RETRY_ATTEMPTS} failed ${jobErr.errorCode ?? 'unknown'} — waiting ${wait}s before retry (snippet: ${(jobErr.detectedSnippet ?? '').slice(0, 80)})`,
+      );
+      if (wait > 0) {
+        pauseWebengine(wait, `job error ${jobErr.errorCode ?? 'unknown'}`);
+        await sleep(wait * 1000);
+      }
+    }
+  }
+  throw new Error(
+    `webengine gave up after ${WEBENGINE_MAX_RETRY_ATTEMPTS} retries: ${lastErr?.errorCode ?? 'unknown'} — ${(lastErr?.error ?? '').slice(0, 200)}`,
+  );
+}
+
+/**
+ * Single-attempt webengine call: POST /ask, poll /job/:id, return
+ * the text on done OR throw with an attached `_jobError` on a
+ * structured {errorCode,suggestedWaitSec} response. Infrastructure
+ * errors (HTTP 5xx, no jobId, etc) throw plain Errors without
+ * _jobError so the retry wrapper lets them bubble up.
+ */
+async function callWebengineOnce(
   baseUrl: string,
   apiKey: string,
   model: string,
@@ -418,6 +495,9 @@ async function callWebengine(
       attachments?: Array<{ name: string; url: string }>;
       fileUrl?: string;
       error?: string;
+      errorCode?: string;
+      suggestedWaitSec?: number;
+      detectedSnippet?: string;
     };
     if (body.status === 'done') {
       // When saveFile:true was set on the submit, webengine writes
@@ -447,9 +527,27 @@ async function callWebengine(
       return { text: content, conversationId: convId };
     }
     if (body.status === 'error') {
-      throw new Error(
-        `webengine job ${jobId} error: ${(body.error ?? 'unknown').slice(0, 300)}`,
-      );
+      // login_required is a hard stop — throw a typed error so
+      // callers can short-circuit without touching the retry loop.
+      if (body.errorCode === 'login_required') {
+        throw new WebengineLoginRequiredError(
+          body.error ?? body.detectedSnippet ?? 'unknown',
+        );
+      }
+      // Any other structured error becomes a retryable failure.
+      // We attach the parsed fields as _jobError on a plain Error
+      // so the outer retry wrapper can decide how long to wait.
+      const jobError: WebengineJobError = {
+        errorCode: body.errorCode,
+        error: body.error,
+        suggestedWaitSec: body.suggestedWaitSec,
+        detectedSnippet: body.detectedSnippet,
+      };
+      const err = new Error(
+        `webengine job ${jobId} error ${body.errorCode ?? 'unknown'}: ${(body.error ?? 'no message').slice(0, 200)}`,
+      ) as Error & { _jobError?: WebengineJobError };
+      err._jobError = jobError;
+      throw err;
     }
   }
   throw new Error(`webengine job ${jobId} timed out after ${timeoutMs}ms`);
