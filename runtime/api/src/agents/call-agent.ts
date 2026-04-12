@@ -221,8 +221,16 @@ export async function callAgent(
 // Jonas's explicit guidance (2026-04-11): max 5 simultaneous; must
 // wait between bursts; stop everything if ChatGPT says temporarily
 // limited.
-const WEBENGINE_MAX_CONCURRENT = 5;
-const WEBENGINE_MIN_DELAY_MS = 8_000;
+// Tightened 2026-04-12 after hitting ChatGPT's "You're making
+// requests too quickly" anti-abuse during back-to-back reports.
+// The previous 5 concurrent / 8s min delay averaged ~7 calls/min
+// sustained, which tripped the per-account rate limit when 4
+// agent roles (classifier, planner, reviewer, summarizer) fired
+// per task. 2 concurrent / 15s delay caps us at ~4 calls/min —
+// comfortably under ChatGPT's burst threshold. Tasks take ~90s
+// longer through the pipeline, but the pipeline doesn't wedge.
+const WEBENGINE_MAX_CONCURRENT = 2;
+const WEBENGINE_MIN_DELAY_MS = 15_000;
 const WEBENGINE_COOLDOWN_MS = 10 * 60 * 1000;
 
 let webengineActive = 0;

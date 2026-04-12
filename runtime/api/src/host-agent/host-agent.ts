@@ -1,5 +1,6 @@
 /* eslint-disable no-console */
 import 'reflect-metadata';
+import { spawn } from 'node:child_process';
 import { DataSource } from 'typeorm';
 import { buildDataSource } from '../data-source';
 
@@ -51,7 +52,15 @@ import { buildDataSource } from '../data-source';
 
 const POLL_INTERVAL_MS = 3_000;
 const BATCH_SIZE = 5;
-const DRY_RUN = true;
+/**
+ * Real apply path is now on by default. Set DEVLOOP_HOST_AGENT_APPLY=0
+ * to force dry-run. When real apply is on, the host-agent shells out
+ * to /usr/local/bin/devloop-apply-to-crm.sh with the target SHA; that
+ * script does git fetch + build + pm2 restart + health probe.
+ */
+const DRY_RUN = process.env['DEVLOOP_HOST_AGENT_APPLY'] !== '1';
+const APPLY_SCRIPT = '/usr/local/bin/devloop-apply-to-crm.sh';
+const APPLY_TIMEOUT_MS = 10 * 60 * 1000;
 
 const HOST_AGENT_ID = `ha-${process.pid}-${Date.now().toString(36)}`;
 
@@ -156,32 +165,45 @@ async function applyOne(ds: DataSource, d: PendingDeploy): Promise<void> {
     d.project_id,
   ]);
 
-  // Step 3: dry-run apply. Real deployment would:
-  //   - verify signature against signing_keys.public_key
-  //   - git fetch + checkout deploy_sha
-  //   - run post_deploy_command
-  //   - poll health_check_url for 60s
-  //   - report success/failed
+  // Step 3: apply the change. In dry-run mode we just wait and
+  // pretend; in real mode we shell out to the apply script
+  // which does git fetch + build + pm2 restart + health probe.
+  let applyStatus: 'success' | 'failed' = 'success';
+  let applyLog = '';
+
   if (DRY_RUN) {
     await sleep(300);
     console.log(`[ha]   (dry-run: pretending apply succeeded)`);
+    applyLog = `dry-run apply by ${HOST_AGENT_ID}`;
+  } else {
+    const scriptResult = await runApplyScript(d.deploy_sha);
+    applyStatus = scriptResult.ok ? 'success' : 'failed';
+    applyLog = scriptResult.log.slice(-4000);
+    if (!scriptResult.ok) {
+      console.error(
+        `[ha]   ✗ apply failed for ${d.project_slug} seq=${d.seq_no} exit=${scriptResult.exitCode}`,
+      );
+    }
   }
 
-  // Step 4: record final success.
+  // Step 4: record final outcome — success OR failed. Either way
+  // the deployer loop picks it up: success → verifying → ready_
+  // for_test; failed → the rollback path kicks in.
   const finished = (await ds.query(
     `
     SELECT public.record_deploy_applied(
       $1::uuid, $2::uuid,
-      'success'::public.apply_status_enum,
-      $3::varchar(64),
-      $4::text
+      $3::public.apply_status_enum,
+      $4::varchar(64),
+      $5::text
     ) AS ok
     `,
     [
       d.desired_state_id,
       d.project_id,
-      d.deploy_sha,
-      `dry-run apply by ${HOST_AGENT_ID}`,
+      applyStatus,
+      applyStatus === 'success' ? d.deploy_sha : null,
+      applyLog,
     ],
   )) as Array<{ ok: boolean }>;
   if (finished[0]?.ok !== true) {
@@ -190,7 +212,66 @@ async function applyOne(ds: DataSource, d: PendingDeploy): Promise<void> {
     );
     return;
   }
-  console.log(`[ha]   ✓ applied ${d.project_slug} seq=${d.seq_no}`);
+  console.log(
+    `[ha]   ${applyStatus === 'success' ? '✓' : '✗'} ${applyStatus} ${d.project_slug} seq=${d.seq_no}`,
+  );
+}
+
+/**
+ * Shell out to /usr/local/bin/devloop-apply-to-crm.sh. Returns
+ * ok=true on exit code 0, false otherwise. Captures the full
+ * stdout+stderr so record_deploy_applied can stash a log
+ * excerpt in desired_state_history.applied_log_excerpt.
+ *
+ * Hard kill after APPLY_TIMEOUT_MS (10 minutes). If the build
+ * hangs that long something is very wrong and the rollback
+ * path should take over rather than blocking the host-agent
+ * loop forever.
+ */
+async function runApplyScript(
+  targetSha: string,
+): Promise<{ ok: boolean; exitCode: number; log: string }> {
+  return new Promise((resolve) => {
+    const proc = spawn(APPLY_SCRIPT, [targetSha], {
+      cwd: '/',
+      stdio: ['ignore', 'pipe', 'pipe'],
+      env: {
+        PATH: process.env['PATH'] ?? '/usr/local/bin:/usr/bin:/bin',
+        HOME: process.env['HOME'] ?? '/home/jonas',
+      },
+    });
+    let output = '';
+    proc.stdout.on('data', (chunk: Buffer) => {
+      output += chunk.toString('utf8');
+    });
+    proc.stderr.on('data', (chunk: Buffer) => {
+      output += chunk.toString('utf8');
+    });
+    const timer = setTimeout(() => {
+      proc.kill('SIGKILL');
+      resolve({
+        ok: false,
+        exitCode: -1,
+        log: output + '\n[ha] SIGKILL after apply timeout',
+      });
+    }, APPLY_TIMEOUT_MS);
+    proc.on('error', (err) => {
+      clearTimeout(timer);
+      resolve({
+        ok: false,
+        exitCode: -2,
+        log: `spawn error: ${err.message}`,
+      });
+    });
+    proc.on('close', (code) => {
+      clearTimeout(timer);
+      resolve({
+        ok: code === 0,
+        exitCode: code ?? -1,
+        log: output,
+      });
+    });
+  });
 }
 
 function sleep(ms: number): Promise<void> {
